@@ -68,9 +68,9 @@ def upload_bytes_to_sharepoint(file_bytes: bytes, remote_filename: str) -> None:
         folder.upload_file(remote_filename, file_bytes).execute_query()
         print(f"✅ Uploaded {remote_filename} to SharePoint")
     except ClientRequestException as ex:
-        print(f"❌ SharePoint error: {ex}")
+        print(f"SharePoint error: {ex}")
     except Exception as e:
-        print(f"❌ Unexpected error uploading {remote_filename}: {e}")
+        print(f"Unexpected error uploading {remote_filename}: {e}")
 
 # =========================
 # SharePoint log
@@ -130,10 +130,10 @@ def upload_bytes_to_sharepoint(file_bytes: bytes, filename: str) -> None:
         folder.upload_file(filename, file_bytes).execute_query()
         logging.info(f"✅ Uploaded {filename} to SharePoint")
     except ClientRequestException as e:
-        logging.error(f"❌ SharePoint error uploading {filename}: {e}")
+        logging.error(f"SharePoint error uploading {filename}: {e}")
         raise
     except Exception as e:
-        logging.error(f"❌ Unexpected error uploading {filename}: {e}")
+        logging.error(f"Unexpected error uploading {filename}: {e}")
         raise
 
 # =========================
@@ -765,7 +765,7 @@ def download_file_from_sharepoint(remote_filename: str) -> bytes | None:
         buf.seek(0)
         return buf.read()
     except Exception as e:
-        print(f"❌ Error downloading {remote_filename}: {e}")
+        print(f"Error downloading {remote_filename}: {e}")
         return None
     
 
@@ -855,10 +855,10 @@ class PDF(FPDF):
             file_bytes = file.download().execute_query()
             return file_bytes
         except ClientRequestException as ex:
-            print(f"❌ SharePoint error downloading {logo_filename}: {ex}")
+            print(f"SharePoint error downloading {logo_filename}: {ex}")
             return None
         except Exception as e:
-            print(f"❌ Unexpected error downloading {logo_filename}: {e}")
+            print(f"Unexpected error downloading {logo_filename}: {e}")
             return None
 
     def header(self):
@@ -866,7 +866,7 @@ class PDF(FPDF):
             try:
                 self.image(BytesIO(self.logo_bytes), x=10, y=5, w=71)
             except Exception as e:
-                logger.error(f"❌ Error rendering logo: {e}")
+                logger.error(f"Error rendering logo: {e}")
         self.set_font("Arial", "", 8)
         right_edge = 190
         lines = [
@@ -974,7 +974,7 @@ def main():
         if not do_insert:
             skipped_duplicates += 1
             logger.info(f"Duplicate invoice (same total) detected: {invoice_no}; skipping PDF and history.")
-            continue   # ✅ skip everything (PDF + SharePoint)
+            continue   # skip everything (PDF + SharePoint)
 
         # ---- PDF Setup ----
         pdf = PDF()
