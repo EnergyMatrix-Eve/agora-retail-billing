@@ -2,6 +2,7 @@ import azure.functions as func
 import datetime
 import os
 import logging
+# test comment
 
 logging.warning("✅ function_app.py imported successfully")
 
