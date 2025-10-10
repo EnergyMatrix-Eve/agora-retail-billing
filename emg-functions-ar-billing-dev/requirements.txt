@@ -3,10 +3,12 @@
 # azure-monitor-opentelemetry 
 
 azure-functions
-numpy
 pandas
+numpy
 matplotlib
 fpdf2
-SQLAlchemy
 python-dotenv
+SQLAlchemy
 pyodbc
+msal
+office365-rest-python-client
