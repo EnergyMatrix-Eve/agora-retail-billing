@@ -1,50 +1,65 @@
 import azure.functions as func
-import datetime
-import os
 import logging
+import os
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+# Import your main billing logic
+import bill_generator
 
-logging.warning("✅ function_app.py imported successfully")
-
-try:
-    import bill_generator
-    logging.warning(f"✅ bill_generator_azure imported from: {bill_generator.__file__}")
-except Exception as e:
-    logging.exception(f"Failed to import bill_generator: {e}")
-    bill_generator = None
-
-
-def run_billing():
-    if bill_generator is not None:
-        logging.warning("📄 Import succeeded. Running bill_generator.main() ...")
-        bill_generator.main()
-        logging.warning("📄 bill_generator.main() finished.")
-    else:
-        logging.error("bill_generator is None, cannot run the billing.")
+def run_billing(env_name: str):
+    logging.warning(f"🚀 Running bill_generator.main() for {env_name}")
+    bill_generator.main()
+    logging.warning(f"✅ bill_generator.main() completed for {env_name}")
 
 
 app = func.FunctionApp()
 
 # --------------------------
-# Environment-based schedule
+#  LOCAL - every 10 minutes
 # --------------------------
-MODE = os.getenv("BILLING_MODE", "production").lower()
-if MODE == "local":
-    cron_schedule = "0 */1 * * * *"  # every 1 min for local testing
-    monitor_flag = False
-else:
-    cron_schedule = "0 0 0 2 * *"    # run at midnight on 2nd
-    monitor_flag = True
+@app.function_name(name="LocalBillingTimer")
+@app.schedule(
+    schedule="0 */10 * * * *",      # every 10 minutes
+    timezone="UTC",
+    arg_name="myTimer",
+    use_monitor=False
+)
+def local_billing_timer(myTimer: func.TimerRequest):
+    if os.getenv("BILLING_MODE", "local").lower() == "local":
+        logging.warning("🧩 LocalBillingTimer fired")
+        run_billing("LOCAL")
+    else:
+        logging.info("⏭️ LocalBillingTimer skipped (not local mode)")
 
-logging.warning(f"Billing Function starting in {MODE.upper()} mode with schedule: {cron_schedule}")
+# --------------------------
+#  CLOUD TEST - every day
+# --------------------------
+@app.function_name(name="CloudTestBillingTimer")
+@app.schedule(
+    schedule="0 30 5 * * *",         # daily at 5.30am UTC
+    timezone="UTC",
+    arg_name="myTimer",
+    use_monitor=True
+)
+def cloud_test_billing_timer(myTimer: func.TimerRequest):
+    if os.getenv("BILLING_MODE", "test").lower() == "test":
+        logging.warning("🧪 CloudTestBillingTimer fired")
+        run_billing("CLOUD TEST")
+    else:
+        logging.info("⏭️ CloudTestBillingTimer skipped (not test mode)")
 
-@app.function_name(name="MonthlyBillingTimer")
-@app.schedule(schedule=cron_schedule, timezone="UTC", arg_name="myTimer", use_monitor=monitor_flag)
-def monthly_billing_timer(myTimer: func.TimerRequest) -> None:
-    logging.warning(f"🚀 monthly_billing_timer fired at {datetime.datetime.utcnow()} - entering function body")
-    try:
-        run_billing()
-        logging.warning("✅ monthly_billing_timer completed")
-    except Exception as e:
-        logging.error(f"Error in monthly_billing_timer: {e}")
+# --------------------------
+#  CLOUD PROD - 2nd each month
+# --------------------------
+@app.function_name(name="CloudProdBillingTimer")
+@app.schedule(
+    schedule="0 0 0 14 * *",         # 14th day of each month at midnight UTC
+    timezone="UTC",
+    arg_name="myTimer",
+    use_monitor=True
+)
+def cloud_prod_billing_timer(myTimer: func.TimerRequest):
+    if os.getenv("BILLING_MODE", "production").lower() == "production":
+        logging.warning("🏭 CloudProdBillingTimer fired")
+        run_billing("CLOUD PROD")
+    else:
+        logging.info("⏭️ CloudProdBillingTimer skipped (not production mode)")
