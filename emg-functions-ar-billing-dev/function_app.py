@@ -14,52 +14,32 @@ def run_billing(env_name: str):
 app = func.FunctionApp()
 
 # --------------------------
-#  LOCAL - every 10 minutes
+# Environment-based schedule
 # --------------------------
-@app.function_name(name="LocalBillingTimer")
-@app.schedule(
-    schedule="0 */10 * * * *",      # every 10 minutes
-    timezone="UTC",
-    arg_name="myTimer",
-    use_monitor=False
-)
-def local_billing_timer(myTimer: func.TimerRequest):
-    if os.getenv("BILLING_MODE", "local").lower() == "local":
-        logging.warning("🧩 LocalBillingTimer fired")
-        run_billing("LOCAL")
-    else:
-        logging.info("⏭️ LocalBillingTimer skipped (not local mode)")
+MODE = os.getenv("BILLING_MODE", "production").lower()
+if MODE == "local":
+    cron_schedule = "0 */2 * * * *"  # every 2 min for local testing
+    monitor_flag = False
+else:
+    cron_schedule = "0 0 0 2 * *"    # midnight on 2nd
+    monitor_flag = True
+
+logging.warning(f"Billing Function starting in {MODE.upper()} mode with schedule: {cron_schedule}")
+
+@app.function_name(name="MonthlyBillingTimer")
+@app.schedule(schedule=cron_schedule, timezone="UTC", arg_name="myTimer", use_monitor=monitor_flag)
+def monthly_billing_timer(myTimer: func.TimerRequest) -> None:
+    logging.warning("🚀 monthly_billing_timer fired - entering function body")
+    run_billing()
+    logging.warning("✅ monthly_billing_timer completed")
+
 
 # --------------------------
-#  CLOUD TEST - every day
+# Manual HTTP trigger for testing
 # --------------------------
-@app.function_name(name="CloudTestBillingTimer")
-@app.schedule(
-    schedule="0 30 5 * * *",         # daily at 5.30am UTC
-    timezone="UTC",
-    arg_name="myTimer",
-    use_monitor=True
-)
-def cloud_test_billing_timer(myTimer: func.TimerRequest):
-    if os.getenv("BILLING_MODE", "test").lower() == "test":
-        logging.warning("🧪 CloudTestBillingTimer fired")
-        run_billing("CLOUD TEST")
-    else:
-        logging.info("⏭️ CloudTestBillingTimer skipped (not test mode)")
-
-# --------------------------
-#  CLOUD PROD - 2nd each month
-# --------------------------
-@app.function_name(name="CloudProdBillingTimer")
-@app.schedule(
-    schedule="0 0 0 14 * *",         # 14th day of each month at midnight UTC
-    timezone="UTC",
-    arg_name="myTimer",
-    use_monitor=True
-)
-def cloud_prod_billing_timer(myTimer: func.TimerRequest):
-    if os.getenv("BILLING_MODE", "production").lower() == "production":
-        logging.warning("🏭 CloudProdBillingTimer fired")
-        run_billing("CLOUD PROD")
-    else:
-        logging.info("⏭️ CloudProdBillingTimer skipped (not production mode)")
+@app.function_name(name="TriggerBillingHttp")
+@app.route(route="runbilling", methods=["GET", "POST"], auth_level=func.AuthLevel.FUNCTION)
+def trigger_billing_http(req: func.HttpRequest) -> func.HttpResponse:
+    logging.warning("🌐 Manual trigger received via HTTP")
+    run_billing()
+    return func.HttpResponse("✅ Billing run executed successfully!", status_code=200)
