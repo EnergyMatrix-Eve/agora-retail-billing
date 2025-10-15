@@ -155,7 +155,7 @@ mpl.rcParams["font.family"] = "Arial"
 # =========================
 def get_engine():
     return create_engine(
-        f"mssql+pyodbc://{username}:{password}@{server}/{database}?driver=ODBC+Driver+17+for+SQL+Server",
+        f"mssql+pyodbc://{username}:{password}@{server}/{database}?driver=ODBC+Driver+18+for+SQL+Server",
         fast_executemany=True
     )
 
