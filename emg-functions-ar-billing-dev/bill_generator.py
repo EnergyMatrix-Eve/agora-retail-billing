@@ -369,7 +369,7 @@ def generate_pie_chart(breakdown_series: pd.Series, custom_colors_map: Dict[str,
         handles=handles,
         labels=labels,
         loc="lower center",
-        bbox_to_anchor=(0.5, 0),
+        bbox_to_anchor=(0.5, 0.15),
         ncol=2,
         frameon=False,
         fontsize=8
@@ -384,33 +384,28 @@ def generate_pie_chart(breakdown_series: pd.Series, custom_colors_map: Dict[str,
     buf.seek(0)
     return buf
 
-
-
 def generate_consumption_chart(
     mirn: str,
     billing_period: str,
     cust_consumption_df: pd.DataFrame,
     contract_mdq: Optional[float],
-    output_path: str,
-    fig_height_mm: float = 80.0,
-) -> bool:
+    fig_height_mm: float = 80.0
+) -> BytesIO:
     if cust_consumption_df.empty:
-        return False
+        return BytesIO()
 
     df = cust_consumption_df.copy()
     df["gas_date"] = pd.to_datetime(df["gas_date"], errors="coerce")
     df["gj_consumption"] = pd.to_numeric(df["gj_consumption"], errors="coerce")
     df = df.dropna(subset=["gas_date", "gj_consumption"]).sort_values("gas_date")
     if df.empty:
-        return False
+        return BytesIO()
 
     start_date = df["gas_date"].min()
-    end_date   = df["gas_date"].max()
-    if pd.isna(start_date) or pd.isna(end_date):
-        return False
+    end_date = df["gas_date"].max()
 
     fig_width_mm = 180.0
-    fig = plt.figure(figsize=(fig_width_mm/25.4, fig_height_mm/25.4))
+    fig = plt.figure(figsize=(fig_width_mm / 25.4, fig_height_mm / 25.4))
     ax = fig.add_subplot(111)
 
     light_blue = "#f0f8ff"
@@ -419,10 +414,9 @@ def generate_consumption_chart(
 
     fig.subplots_adjust(left=0.12, right=0.98, top=0.94, bottom=0.32)
 
-    ax.set_title(f"MIRN: {mirn}    Period: {billing_period}",
-                 fontsize=7, fontweight="bold", pad=2)
+    ax.set_title(f"MIRN: {mirn}    Period: {billing_period}", fontsize=7, fontweight="normal", pad=4)
 
-    ax.bar(df["gas_date"], df["gj_consumption"], label="Daily Consumption", alpha=0.95)
+    ax.bar(df["gas_date"], df["gj_consumption"], label="Daily Consumption", alpha=0.95, color="#2A9D8F")
 
     if contract_mdq is not None and np.isfinite(float(contract_mdq)) and float(contract_mdq) > 0:
         ax.axhline(
@@ -433,12 +427,12 @@ def generate_consumption_chart(
             zorder=3
         )
 
-    ax.set_xlim(start_date - timedelta(days=1), end_date + timedelta(days=1))
-    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax.set_xlim(start_date, end_date)
+    ax.xaxis.set_major_locator(mdates.DayLocator(interval=1))
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
     ax.margins(x=0.005)
 
-    ax.tick_params(axis="x", labelrotation=45, labelsize=6, pad=1, length=0)
+    ax.tick_params(axis="x", labelrotation=45, labelsize=6, pad=3, length=0)
     for lbl in ax.get_xticklabels():
         lbl.set_fontweight("bold")
 
@@ -448,7 +442,7 @@ def generate_consumption_chart(
     ax.set_ylim(0, ymax * 1.08 if ymax > 0 else 10)
     ax.set_axisbelow(True)
     ax.grid(which="both", axis="both", linestyle="--", linewidth=0.5)
-    ax.tick_params(axis="y", labelsize=6)
+    ax.tick_params(axis="y", labelsize=8)
     for s in ("top", "right", "left"):
         ax.spines[s].set_visible(False)
     ax.spines["bottom"].set_linewidth(1)
@@ -458,42 +452,46 @@ def generate_consumption_chart(
         fig.legend(
             handles, labels,
             loc="lower center",
-            bbox_to_anchor=(0.5, 0.0),
+            bbox_to_anchor=(0.5, -0.1),
             ncol=max(1, len(labels)),
             frameon=False,
             prop=FontProperties(size=6, weight="bold")
         )
 
-    fig.savefig(output_path, dpi=300, bbox_inches="tight", facecolor=fig.get_facecolor())
+    buf_c = BytesIO()
+    fig.savefig(buf_c, format="png", dpi=300, bbox_inches="tight", facecolor=fig.get_facecolor())
+    buf_c.seek(0)
     plt.close(fig)
-    return True
+    return buf_c
 
-
-def generate_accounts_mirn_chart(billing_period: str, df: pd.DataFrame, output_path: str) -> bool:
+def generate_accounts_mirn_chart(billing_period: str, df: pd.DataFrame, selected_mirns: list) -> BytesIO:
     if df.empty:
-        return False
+        return BytesIO()
 
     use = df.copy()
     use["gas_date"] = pd.to_datetime(use["gas_date"], errors="coerce")
     use["gj_consumption"] = pd.to_numeric(use["gj_consumption"], errors="coerce")
     use["mirn"] = use["mirn"].astype(str)
-    use = use.dropna(subset=["gas_date", "gj_consumption", "mirn"])
-    if use.empty:
-        return False
+    use = use.dropna(subset=["gas_date", "gj_consumption"]).sort_values("gas_date")
 
-    piv = (use.pivot_table(index="gas_date", columns="mirn", values="gj_consumption", aggfunc="sum")
-               .sort_index())
-    if piv.empty:
-        return False
+    if use.empty:
+        return BytesIO()
+    
+    use = use[use["mirn"].isin(selected_mirns)]
+    if use.empty:
+        return BytesIO()
+    
+    piv = use.pivot_table(index="gas_date", columns="mirn", values="gj_consumption", aggfunc="sum")
 
     start_date = piv.index.min()
     end_date   = piv.index.max()
     if pd.isna(start_date) or pd.isna(end_date):
-        return False
+        return BytesIO()
+    
 
     fig_width_mm = 180
-    fig_height_mm = 32
-    fig = plt.figure(figsize=(fig_width_mm/25.4, fig_height_mm/25.4))
+    fig_height_mm: float = 32.0
+    fig = plt.figure(figsize=(fig_width_mm / 25.4, fig_height_mm / 25.4))
     ax = fig.add_subplot(111)
 
     light_blue = "#f0f8ff"
@@ -502,8 +500,8 @@ def generate_accounts_mirn_chart(billing_period: str, df: pd.DataFrame, output_p
 
     fig.subplots_adjust(left=0.12, right=0.98, top=0.94, bottom=0.32)
 
-    ax.set_title(f"Aggregated Consumption    Period: {billing_period}",
-                 fontsize=7, fontweight="bold", pad=2)
+    ax.set_title(f"MIRN: Aggregated Consumption    Period: {billing_period}",
+                 fontsize=7, fontweight="normal", pad=4)
 
     cols = sorted(list(piv.columns))
     x = piv.index
@@ -529,12 +527,12 @@ def generate_accounts_mirn_chart(billing_period: str, df: pd.DataFrame, output_p
 
     ax.axhline(y=3000, linewidth=1.5, color="#000000", label="Aggregated MDQ.", zorder=3)
 
-    ax.set_xlim(start_date - timedelta(days=1), end_date + timedelta(days=1))
-    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax.set_xlim(start_date, end_date)
+    ax.xaxis.set_major_locator(mdates.DayLocator(interval=1))
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
     ax.margins(x=0.005)
 
-    ax.tick_params(axis="x", labelrotation=45, labelsize=6, pad=1, length=0)
+    ax.tick_params(axis="x", labelrotation=45, labelsize=6, pad=3, length=0)
     for lbl in ax.get_xticklabels():
         lbl.set_fontweight("bold")
 
@@ -548,20 +546,44 @@ def generate_accounts_mirn_chart(billing_period: str, df: pd.DataFrame, output_p
         ax.spines[s].set_visible(False)
     ax.spines["bottom"].set_linewidth(1)
 
+    # Adding legend for 'mirn'
     handles, labels = ax.get_legend_handles_labels()
     ncols = max(1, len(labels))
     fig.legend(
         handles, labels,
         loc="lower center",
-        bbox_to_anchor=(0.5, 0),
+        bbox_to_anchor=(0.5, -0.1),
         ncol=ncols,
         frameon=False,
         prop=FontProperties(size=6, weight="bold")
     )
 
-    fig.savefig(output_path, dpi=300, bbox_inches="tight", facecolor=fig.get_facecolor())
+    buf_m = BytesIO()
+    fig.savefig(buf_m, format="png", dpi=300, bbox_inches="tight", facecolor=fig.get_facecolor())
+    buf_m.seek(0)
     plt.close(fig)
-    return True
+    return buf_m
+
+def embed_chart_in_pdf(pdf: FPDF, chart_buf: BytesIO, chart_height_mm: float) -> None:
+    """
+    Embeds a chart (from a BytesIO buffer) into the PDF.
+    
+    Args:
+        pdf (FPDF): The PDF document to embed the chart into.
+        chart_buf (BytesIO): The BytesIO buffer containing the chart image data.
+        chart_height_mm (float): The desired height for the chart in mm.
+    """
+    # Check the size of the chart buffer before embedding
+    chart_size = len(chart_buf.getvalue())
+    if chart_size == 0:
+        logger.error("The chart buffer is empty. Skipping chart embedding.")
+        return
+
+    y_start = pdf.get_y()  # Current y position of the PDF
+    CHART_W_MM = 180.0
+    pdf.image(chart_buf, x=10, y=y_start, w=CHART_W_MM, h=chart_height_mm)
+    pdf.set_y(y_start + chart_height_mm + 2)  # Update the y position for the next element
+    logger.info(f"Chart embedded at y={y_start}, height={chart_height_mm}")
 
 # =========================
 # Writeback helpers
@@ -836,6 +858,35 @@ def debug_validate_not_nulls(engine, row: Dict[str, Any]) -> None:
     else:
         print("  - PASS: All NOT NULL columns are non-null for the sample row.")
 
+def compute_aggregated_mdq(daily_df: pd.DataFrame,
+                           selected_mirns: list,
+                           start_date: Optional[pd.Timestamp],
+                           end_date: Optional[pd.Timestamp]) -> Optional[float]:
+    """
+    Max daily GJ consumption across the selected MIRNs within the billing period.
+    """
+    if daily_df.empty or not selected_mirns:
+        return None
+
+    df = daily_df.copy()
+    df["gas_date"] = pd.to_datetime(df["gas_date"], errors="coerce")
+    df["gj_consumption"] = pd.to_numeric(df["gj_consumption"], errors="coerce")
+    df["mirn"] = df["mirn"].astype(str)
+    df = df.dropna(subset=["gas_date", "gj_consumption"])
+
+    # Filter to selected MIRNs and the invoice's billing window
+    df = df[df["mirn"].isin([str(m) for m in selected_mirns])]
+    if pd.notna(start_date):
+        df = df[df["gas_date"] >= start_date.normalize()]
+    if pd.notna(end_date):
+        df = df[df["gas_date"] <= end_date.normalize()]
+
+    if df.empty:
+        return None
+
+    # Sum all selected MIRNs per day, then take the maximum day total
+    daily_totals = df.groupby("gas_date", as_index=False)["gj_consumption"].sum()
+    return float(daily_totals["gj_consumption"].max()) if not daily_totals.empty else None
 
 # =========================
 # PDF Class
@@ -1329,13 +1380,17 @@ def main():
         pdf.cell(90, 4, f"${float(gst):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
         pdf.line(10, pdf.get_y()+1, 190, pdf.get_y()+1)
 
-        # Daily consumption
+        # === Daily consumption ===
         cust_consumption = pd.DataFrame()
         if not daily.empty and "mirn" in daily.columns:
             cust_consumption = daily[daily["mirn"] == mirn].copy()
-        
-        contract_mdq: Optional[float] = None
-        monthly_mdq: Optional[float] = None
+
+        # Calculate monthly_mdq (maximum daily consumption)
+        monthly_mdq = None
+        if not cust_consumption.empty:
+            monthly_mdq = cust_consumption["gj_consumption"].max()  # Maximum daily consumption
+
+        contract_mdq = cust_consumption["retail_mdq"].iloc[0]
 
         # === MDQ box above Consumption Chart ===
         pdf.set_xy(10, 145)
@@ -1348,115 +1403,94 @@ def main():
             except (TypeError, ValueError):
                 return ""
 
-        pdf.set_font("Arial", "BU", 8); pdf.cell(label_w, 4, "MDQ of the month")
-        pdf.set_font("Arial", "U", 8);  pdf.cell(value_w, 4, fmt_gj(monthly_mdq), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        # MDQ box for monthly and contract MDQ
+        pdf.set_font("Arial", "BU", 8)
+        pdf.cell(label_w, 4, "MDQ of the month")
+        pdf.set_font("Arial", "U", 8)
+        pdf.cell(value_w, 4, fmt_gj(monthly_mdq), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
-        pdf.set_font("Arial", "BU", 8); pdf.cell(label_w, 4, "Contract MDQ")
+        pdf.set_font("Arial", "BU", 8)
+        pdf.cell(label_w, 4, "Contract MDQ")
         val = "" if contract_mdq is None else fmt_gj(contract_mdq)
-        pdf.set_font("Arial", "U", 8);  pdf.cell(value_w, 4, val, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_font("Arial", "U", 8)
+        pdf.cell(value_w, 4, val, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
         pdf.rect(10, 145, 70, 8)
         pdf.ln(1)
 
-        # === NEW CHART: only for these accounts ===
-        accounts = (30007, 30008, 30009)
-        multi_mirn_ok = False
-        aggregated_monthly_mdq: Optional[float] = None
-
-        acct_num = pd.to_numeric(acct, errors="coerce")
-        if pd.notna(acct_num) and int(acct_num) in accounts:
-            need_cols = {"account_number", "gas_date", "gj_consumption", "mirn"}
-            if not daily.empty and need_cols.issubset(daily.columns):
-                acc_df = daily[list(need_cols)].copy()
-                acc_df["account_number"] = pd.to_numeric(acc_df["account_number"], errors="coerce").astype("Int64")
-                acc_df["gas_date"] = pd.to_datetime(acc_df["gas_date"], errors="coerce")
-                acc_df["gj_consumption"] = pd.to_numeric(acc_df["gj_consumption"], errors="coerce")
-                acc_df = acc_df.dropna(subset=["account_number", "gas_date", "gj_consumption", "mirn"])
-                acc_df = acc_df[acc_df["account_number"].isin(accounts)]
-
-                if not acc_df.empty and pd.notna(start_date_dt) and pd.notna(end_date_dt):
-                    acc_df = acc_df[(acc_df["gas_date"] >= start_date_dt) & (acc_df["gas_date"] <= end_date_dt)]
-
-                if not acc_df.empty:
-                    daily_totals = (acc_df.groupby("gas_date")["gj_consumption"].sum(min_count=1))
-                    if not daily_totals.empty:
-                        aggregated_monthly_mdq = float(daily_totals.max())
-
-                    # --- Generate Multi-MIRN Chart in memory ---
-                    fig_m, ax_m = plt.subplots(figsize=(7, 3))
-                    ax_m.plot(daily_totals.index, daily_totals.values, marker="o")
-                    ax_m.set_title(f"Aggregated MIRN Consumption ({billing_period})")
-                    ax_m.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
-                    plt.xticks(rotation=45, fontsize=6)
-                    plt.tight_layout()
-
-                    buf_m = BytesIO()
-                    fig_m.savefig(buf_m, format="png", dpi=300, bbox_inches="tight")
-                    buf_m.seek(0)
-                    plt.close(fig_m)
-
-                    multi_mirn_ok = True
 
         # === Chart sizing constants ===
         CHART_W_MM      = 180.0
         CHART_FULL_H_MM = 64.0
         CHART_HALF_H_MM = 32.0
 
-        want_half = bool(multi_mirn_ok)
-        first_h_mm = CHART_HALF_H_MM if want_half else CHART_FULL_H_MM
+        # === CHARTS ===
+        selected_mirns = ['5600002119_8', '5600002162_7', '5600462393_7']
+        multi_mirn_ok = False
 
-        # Ensure new page if needed before drawing charts
-        def _ensure_space(h_mm: float) -> None:
-            try:
-                page_h = getattr(pdf, "h", 297)
-                b_margin = getattr(pdf, "b_margin", 10)
-                if pdf.get_y() + h_mm > (page_h - b_margin):
-                    pdf.add_page()
-            except Exception:
-                pdf.add_page()
+        # === Full-height Consumption Chart ===
+        if mirn not in selected_mirns:
+            consumption_chart_buf = generate_consumption_chart(
+                mirn=mirn,
+                billing_period=f"{inv['bill_start_date']} to {inv['bill_end_date']}",
+                cust_consumption_df=cust_consumption,  
+                contract_mdq=contract_mdq,
+                fig_height_mm=CHART_FULL_H_MM  # Full height for other accounts
+            )
+            embed_chart_in_pdf(pdf, consumption_chart_buf, CHART_FULL_H_MM)
 
-        # === Consumption chart ===
-        if not cust_consumption.empty:
-            fig_c, ax_c = plt.subplots(figsize=(7, 3))
-            ax_c.bar(cust_consumption["gas_date"], cust_consumption["gj_consumption"], alpha=0.95)
-            pdf.set_font("Arial", "", 8)
-            ax_c.set_title(f"{mirn}    Period {billing_period}")
-            ax_c.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
-            plt.xticks(rotation=45, fontsize=6)
-            plt.tight_layout()
+        # === Half-height Consumption Chart + Aggregated MDQ Chart ===
+        if mirn in selected_mirns:
+            # Half-height consumption chart
+            consumption_chart_buf = generate_consumption_chart(
+                mirn=mirn,
+                billing_period=f"{inv['bill_start_date']} to {inv['bill_end_date']}",
+                cust_consumption_df=cust_consumption, 
+                contract_mdq=contract_mdq,
+                fig_height_mm=CHART_HALF_H_MM  # Half height for specified accounts
+            )
+            embed_chart_in_pdf(pdf, consumption_chart_buf, CHART_HALF_H_MM)
 
-            buf_c = BytesIO()
-            fig_c.savefig(buf_c, format="png", dpi=300, bbox_inches="tight")
-            buf_c.seek(0)
-            plt.close(fig_c)
+            # === Aggregated MDQ Block ===
+            aggregated_monthly_mdq = compute_aggregated_mdq(
+                daily_df=daily,
+                selected_mirns=selected_mirns,
+                start_date=start_date_dt,
+                end_date=end_date_dt
+            )
+            pdf.rect(10, pdf.get_y(), 70, 8)
 
-            _ensure_space(first_h_mm + 2)
-            y_start = pdf.get_y()
-            pdf.image(buf_c, x=10, y=y_start, w=CHART_W_MM, h=first_h_mm)
-            pdf.set_y(y_start + first_h_mm + 2)
-            logger.info(f"Consumption chart embedded for invoice {invoice_no}")
+            pdf.rect(10, pdf.get_y(), 70, 8)
+            pdf.set_font("Arial", "BU", 8)
+            pdf.cell(label_w + 20, 4, "MDQ of the month (aggregated)")
+            pdf.set_font("Arial", "U", 8)
+            pdf.cell(value_w, 4, fmt_gj(aggregated_monthly_mdq), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
-        # === Multi-MIRN chart (stacked below) ===
-        if multi_mirn_ok:
-            current_y = pdf.get_y()
-
-            # Aggregated MDQ box
-            label_w = 30
-            value_w = 60
-            pdf.set_font("Arial", "BU", 8); pdf.cell(label_w + 20, 4, "MDQ of the month (aggregated)")
-            pdf.set_font("Arial", "U", 8);  pdf.cell(value_w, 4, fmt_gj(aggregated_monthly_mdq), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-
-            pdf.set_font("Arial", "BU", 8); pdf.cell(label_w + 20, 4, "Contract MDQ (aggregated)")
-            pdf.set_font("Arial", "U", 8);  pdf.cell(value_w, 4, fmt_gj(3000), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-
-            pdf.rect(10, current_y, 70, 8)
+            pdf.set_font("Arial", "BU", 8)
+            pdf.cell(label_w + 20, 4, "Contract MDQ (aggregated)")
+            pdf.set_font("Arial", "U", 8)
+            pdf.cell(value_w, 4, fmt_gj(3000), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
             pdf.ln(2)
 
-            # Embed chart directly below
-            pdf.image(buf_m, x=10, w=CHART_W_MM, h=CHART_HALF_H_MM)
-            pdf.set_y(current_y + CHART_HALF_H_MM + 10)
-            logger.info(f"Aggregated multi-MIRN chart embedded for invoice {invoice_no}")
+            # === Multi-MIRN Chart (Stacked) ===
+            accounts_mirn_chart_buf = generate_accounts_mirn_chart(
+                billing_period=f"{inv['bill_start_date']} to {inv['bill_end_date']}",
+                df=daily,
+                selected_mirns=selected_mirns  
+            )
 
+            embed_chart_in_pdf(pdf, accounts_mirn_chart_buf, CHART_HALF_H_MM)
+            multi_mirn_ok = True
 
+        # # Ensure new page if needed before drawing charts
+        # def _ensure_space(h_mm: float) -> None:
+        #     try:
+        #         page_h = getattr(pdf, "h", 297)
+        #         b_margin = getattr(pdf, "b_margin", 10)
+        #         if pdf.get_y() + h_mm > (page_h - b_margin):
+        #             pdf.add_page()
+        #     except Exception:
+        #         pdf.add_page()
 
         # ================= “Please Note” block =================
         pdf.ln(2)
@@ -1491,7 +1525,6 @@ def main():
         pdf.set_font("Arial", "", 7.5)
         pdf.cell(180, 4, "Page 2 of 2")
 
-
         # ---- Save PDF to SharePoint (filename always matches SQL invoice_no) ----
         pdf_filename = f"{invoice_no}_Generated_{GENERATE_DATE}.pdf"
         pdf_bytes = BytesIO()
@@ -1510,9 +1543,6 @@ def main():
                 logger.info(f"No new history row inserted for {invoice_no} (duplicate or skipped)")
         except Exception as e:
             logger.error(f"Failed inserting billing_history for {invoice_no}: {e}")
-
-
-
 
 if __name__ == "__main__":
     main()

@@ -22,8 +22,8 @@ if MODE == "local":
     cron_schedule = "0 */1 * * * *"
     monitor_flag = False
 elif MODE == "testing":
-    # Cloud testing schedule: every day at 4 AM UTC for cloud testing (12pm Perth time)
-    cron_schedule = "0 0 4 * * *"
+    # Cloud testing schedule: every day at 6.45 AM UTC for cloud testing (2.45pm Perth time)
+    cron_schedule = "0 45 6 * * *"
     monitor_flag = True
 elif MODE == "production":
     # Production schedule: # 7 PM UTC on the 1st, which is 5 AM AEST on the 2nd
