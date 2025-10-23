@@ -237,7 +237,7 @@ def build_charges_df_from_breakdown(invoice_lines: pd.DataFrame) -> pd.DataFrame
         "Unit UOM": df["unit_uom"] if "unit_uom" in df.columns else pd.Series([""] * len(df)),
         "Amount ex GST": df["amount"] if "amount" in df.columns else pd.Series([""] * len(df)),
     })
-    order = ["Firm Gas Sales", "Spot Gas Sales", "Distribution Charges", "Transport Fee", "Adjustment Charges", "Other Charges"]
+    order = ["Firm Gas Sales", "Spot Gas Sales", "Transport Fee", "Distribution Charges", "Adjustment Charges", "Other Charges"]
     out["Charge Category"] = pd.Categorical(out["Charge Category"], order, ordered=True)
     out = out.sort_values(["Charge Category","Charge Type"]).reset_index(drop=True)
     return out
@@ -287,8 +287,9 @@ def build_history_row_from_monthly(m: pd.Series) -> Dict[str, Any]:
         total_inc = (float(total_ex or 0) + float(gst_amt or 0))
 
     amount_cols = [
-        "firm_gas_amount","spot_gas_amount","atco_usage_amount","atco_demand_amount","atco_standing_amount",
+        "firm_gas_amount","spot_gas_amount",
         "transport_firm_amount","transport_overrun_amount",
+        "atco_usage_amount","atco_demand_amount","atco_standing_amount",
         "gas_adjustment_charges","distribution_adjustment_charges","regulatory_adjustment_charges",
         "admin_fee","late_payment_fee",
     ]
@@ -416,7 +417,7 @@ def generate_consumption_chart(
 
     ax.set_title(f"MIRN: {mirn}    Period: {billing_period}", fontsize=7, fontweight="normal", pad=4)
 
-    ax.bar(df["gas_date"], df["gj_consumption"], label="Daily Consumption", alpha=0.95, color="#2A9D8F")
+    ax.bar(df["gas_date"], df["gj_consumption"], label="Daily Consumption", alpha=0.95, color="#0089D0")
 
     if contract_mdq is not None and np.isfinite(float(contract_mdq)) and float(contract_mdq) > 0:
         ax.axhline(
@@ -442,7 +443,7 @@ def generate_consumption_chart(
     ax.set_ylim(0, ymax * 1.08 if ymax > 0 else 10)
     ax.set_axisbelow(True)
     ax.grid(which="both", axis="both", linestyle="--", linewidth=0.5)
-    ax.tick_params(axis="y", labelsize=8)
+    ax.tick_params(axis="y", labelsize=6)
     for s in ("top", "right", "left"):
         ax.spines[s].set_visible(False)
     ax.spines["bottom"].set_linewidth(1)
@@ -501,7 +502,7 @@ def generate_accounts_mirn_chart(billing_period: str, df: pd.DataFrame, selected
     fig.subplots_adjust(left=0.12, right=0.98, top=0.94, bottom=0.32)
 
     ax.set_title(f"MIRN: Aggregated Consumption    Period: {billing_period}",
-                 fontsize=7, fontweight="normal", pad=4)
+                 fontsize=6, fontweight="normal", pad=4)
 
     cols = sorted(list(piv.columns))
     x = piv.index
