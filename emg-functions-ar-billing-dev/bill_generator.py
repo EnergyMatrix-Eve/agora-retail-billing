@@ -893,19 +893,21 @@ def compute_aggregated_mdq(daily_df: pd.DataFrame,
 # PDF Class
 # =========================
 class PDF(FPDF):
-    def __init__(self, logo_filename="Agora logo.png", *args, **kwargs):
+    def __init__(self, logo_filename="Agora Logo.png", *args, **kwargs):
         super().__init__(*args, **kwargs)
         # Download logo from the SharePoint folder specified by FOLDER_LOGO
         self.logo_bytes = self.download_file_from_sharepoint(logo_filename)
 
     def download_file_from_sharepoint(self, logo_filename):
-        # This function downloads the file from SharePoint and returns the byte data
         ctx = get_sharepoint_context()
-        folder = ctx.web.get_folder_by_server_relative_url(FOLDER_LOGO)
         try:
-            file = folder.get_file_by_server_relative_url(logo_filename)
-            file_bytes = file.download().execute_query()
-            return file_bytes
+            file = ctx.web.get_file_by_server_relative_url(
+                f"{FOLDER_LOGO.rstrip('/')}/{logo_filename}"
+            )
+            buf = BytesIO()
+            file.download(buf).execute_query()
+            buf.seek(0)
+            return buf.read()
         except ClientRequestException as ex:
             print(f"SharePoint error downloading {logo_filename}: {ex}")
             return None
