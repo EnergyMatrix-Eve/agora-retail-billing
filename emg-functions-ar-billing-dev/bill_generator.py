@@ -428,7 +428,7 @@ def generate_consumption_chart(
             zorder=3
         )
 
-    ax.set_xlim(start_date, end_date)
+    ax.set_xlim(start_date - pd.Timedelta(days=0.7), end_date + pd.Timedelta(days=0.7))
     ax.xaxis.set_major_locator(mdates.DayLocator(interval=1))
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
     ax.margins(x=0.005)
@@ -528,7 +528,7 @@ def generate_accounts_mirn_chart(billing_period: str, df: pd.DataFrame, selected
 
     ax.axhline(y=3000, linewidth=1.5, color="#000000", label="Aggregated MDQ.", zorder=3)
 
-    ax.set_xlim(start_date, end_date)
+    ax.set_xlim(start_date - pd.Timedelta(days=0.7), end_date + pd.Timedelta(days=0.7))
     ax.xaxis.set_major_locator(mdates.DayLocator(interval=1))
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
     ax.margins(x=0.005)
@@ -993,7 +993,12 @@ def main():
         company_name = inv.get("company_name")
         company_code = inv.get("company_code")
         customer_number = inv.get("customer_number")
-        abn = inv.get("abn")
+        abn = str(inv.get("abn"))
+        formatted_abn = (
+            f"{abn[:2]} {abn[2:5]} {abn[5:8]} {abn[8:]}"
+            if abn and len(abn) == 11
+            else abn
+        )
         state = inv.get("state")
         distributor_name = inv.get("distributor")
         purchase_order = inv.get("purchase_order_number")
@@ -1093,7 +1098,7 @@ def main():
         pdf.set_xy(x0, y0)
         pdf.set_font("Arial", "B", 10)
         pdf.cell(80, 6, str(company_name or ""), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.cell(80, 6, f"ABN: {abn or ''}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.cell(80, 6, f"ABN: {formatted_abn or ''}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.cell(80, 4, "", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.cell(80, 6, "Accounts Payable", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.multi_cell(80, 6, postal_text, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
@@ -1107,7 +1112,7 @@ def main():
 
         pdf.set_xy(block_start_x, 45)
         pdf.set_font("Arial", "B", 9); pdf.cell(label_width, 9, "Contact Us", align='R')
-        pdf.set_font("Arial", "", 9.5); pdf.cell(value_width, 9, str(contact_number or ""), new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
+        pdf.set_font("Arial", "", 9.5); pdf.cell(value_width, 9, "1800 40 30 93", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
         pdf.set_x(block_start_x); pdf.set_font("Arial", "B", 9)
         pdf.multi_cell(label_width, 6, f"Distributor ({distributor_name or ''})\n Contact Number", align='R')
         pdf.set_xy(block_start_x + label_width, pdf.get_y() - 12)
@@ -1183,8 +1188,19 @@ def main():
         )
         s_for_pie_cat = s_for_pie_cat[s_for_pie_cat > 0]
 
-        
-        for category, amount in s_for_pie_cat.sort_values(ascending=False).items():
+        order = [
+            "Firm Gas Sales",
+            "Spot Gas Sales",
+            "Transport Fee",
+            "Distribution Charges",
+            "Adjustment Charges",
+            "Other Charges"
+        ]
+
+        s_for_pie_cat.index = pd.CategoricalIndex(s_for_pie_cat.index, categories=order, ordered=True)
+        s_for_pie_cat = s_for_pie_cat.sort_index()
+
+        for category, amount in s_for_pie_cat.items():
             pdf.set_x(10); pdf.set_font("Arial", "", 9)
             pdf.cell(50, 5, str(category), border=0, align="L")
             pdf.cell(40, 5, f"${float(amount):,.2f}", border=0, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="R")
@@ -1348,6 +1364,17 @@ def main():
             pdf.ln(stripe_height)
             row_index += 1
 
+            def format_with_commas(value):
+                try:
+                    s = str(value)
+                    if not re.match(r'^-?\d+(\.\d+)?$', s):
+                        return s  # not a numeric string, return as-is
+                    int_part, dot, frac_part = s.partition('.')
+                    int_part = f"{int(int_part):,}"  # add commas to integer part
+                    return int_part + (dot + frac_part if frac_part else "")
+                except Exception:
+                    return str(value)
+
             # Detail rows
             pdf.set_font("Arial", "", 8)
             for _, row in cat_df.iterrows():
@@ -1357,11 +1384,22 @@ def main():
                 _amt = pd.to_numeric(row.get("Amount ex GST"), errors="coerce")
                 amt_ex_gst_fmt = f"${_amt:,.2f}" if pd.notna(_amt) else ""
 
+                charge_type = str(row.get("Charge Type", "")) or ""
+                rate_val = pd.to_numeric(row.get("Rate"), errors="coerce")
+
+                if pd.notna(rate_val):
+                    if charge_type in ("Firm Gas Sales", "Spot Gas Sales"):
+                        rate_fmt = f"{rate_val:,.6f}"
+                    else:
+                        rate_fmt = f"{rate_val:,.2f}"
+                else:
+                    rate_fmt = ""
+
                 values = [
-                    "          " + str(row.get("Charge Type", "")),
-                    "" if pd.isna(row.get("Rate")) else str(row.get("Rate")),
+                    "          " + charge_type,
+                    rate_fmt,
                     str(row.get("Rate UOM", "")) if pd.notna(row.get("Rate UOM")) else "",
-                    "" if pd.isna(row.get("Unit")) else str(row.get("Unit")),
+                    "" if pd.isna(row.get("Unit")) else f"{float(row.get('Unit')):,.2f}",\
                     str(row.get("Unit UOM", "")) if pd.notna(row.get("Unit UOM")) else "",
                     amt_ex_gst_fmt,
                 ]
@@ -1435,7 +1473,7 @@ def main():
         if mirn not in selected_mirns:
             consumption_chart_buf = generate_consumption_chart(
                 mirn=mirn,
-                billing_period=f"{inv['bill_start_date']} to {inv['bill_end_date']}",
+                billing_period=billing_period,
                 cust_consumption_df=cust_consumption,  
                 contract_mdq=contract_mdq,
                 fig_height_mm=CHART_FULL_H_MM  # Full height for other accounts
@@ -1447,7 +1485,7 @@ def main():
             # Half-height consumption chart
             consumption_chart_buf = generate_consumption_chart(
                 mirn=mirn,
-                billing_period=f"{inv['bill_start_date']} to {inv['bill_end_date']}",
+                billing_period=billing_period,
                 cust_consumption_df=cust_consumption, 
                 contract_mdq=contract_mdq,
                 fig_height_mm=CHART_HALF_H_MM  # Half height for specified accounts
@@ -1477,7 +1515,7 @@ def main():
 
             # === Multi-MIRN Chart (Stacked) ===
             accounts_mirn_chart_buf = generate_accounts_mirn_chart(
-                billing_period=f"{inv['bill_start_date']} to {inv['bill_end_date']}",
+                billing_period=billing_period,
                 df=daily,
                 selected_mirns=selected_mirns  
             )

@@ -2,12 +2,12 @@ import azure.functions as func
 import logging
 import os
 from datetime import datetime
-import bill_generator #_test_statement
+import bill_generator_test_statement#
 
 def run_billing(env_name: str):
-    logging.warning(f"🚀 Running bill_generator.main() for {env_name}")
-    bill_generator.main()#_test_statement
-    logging.warning(f"✅ bill_generator.main() completed for {env_name}")
+    logging.warning(f"🚀 Running bill_generator_test_statement.main() for {env_name}")
+    bill_generator_test_statement.main()#
+    logging.warning(f"✅ bill_generator_test_statement.main() completed for {env_name}")
 
 
 app = func.FunctionApp()
@@ -23,11 +23,11 @@ MODE = os.getenv("BILLING_MODE", "production").lower()
 #     monitor_flag = False
 # el
 if MODE == "testing":
-    # Cloud testing schedule: every day at 6.45 AM UTC for cloud testing (2.45pm Perth time)
-    cron_schedule = "0 45 6 * * *"
+    # Cloud testing schedule: 5 AM AEST on the 2nd, 8 AM PERTH time
+    cron_schedule = "0 0 19 2 * *"
     monitor_flag = True
 elif MODE == "production":
-    # Production schedule: # 7 PM UTC on the 1st, which is 5 AM AEST on the 2nd
+    # Production schedule: # 5 AM AEST on the 2nd, 8 AM PERTH time
     cron_schedule = "0 0 19 2 * *"
     monitor_flag = True
 else:
