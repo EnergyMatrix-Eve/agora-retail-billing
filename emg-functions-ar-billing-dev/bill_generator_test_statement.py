@@ -139,7 +139,7 @@ mpl.rcParams["font.family"] = "Arial"
 # =========================
 def get_engine():
     return create_engine(
-        f"mssql+pyodbc://{username}:{password}@{server}/{database}?driver=ODBC+Driver+18+for+SQL+Server",
+        f"mssql+pyodbc://{username}:{password}@{server}/{database}?driver=ODBC+Driver+18+for+SQL+Server",  
         fast_executemany=True
     )
 
@@ -262,7 +262,7 @@ def build_history_row_from_monthly(m: pd.Series) -> Dict[str, Any]:
         if name in m and pd.notna(m[name]):
             return m[name]
         return default
-
+    site_name = get("site_name")
     bill_start_date = pd.to_datetime(get("bill_start_date"), errors="coerce")
     bill_end_date   = pd.to_datetime(get("bill_end_date"), errors="coerce")
     bill_issue_date = pd.to_datetime(get("bill_issue_date"), errors="coerce")
@@ -1309,7 +1309,9 @@ class PDF(FPDF):
         self.set_font("Arial", "", 8)
         right_edge = 190
         lines = [
-            "PO Box Z5538, St Georges Terrace, WA 6865",
+            "St Georges Terrace",
+            "WA 6865",
+            "PO Box Z5538",
             "Tel: 61 8 9228 1930",
             "ABN 68 612 806 381",
             "www.agoraretail.com.au"
@@ -1318,7 +1320,7 @@ class PDF(FPDF):
             text_width = self.get_string_width(line)
             self.set_xy(right_edge - text_width, 8 + i * 4.4)
             self.cell(text_width, 4.4, line)
-        self.ln(13.5)
+        self.ln(5)
         self.set_draw_color(0, 0, 0)
         self.set_line_width(0.35)
         self.line(10, self.get_y(), 190, self.get_y())
@@ -1387,6 +1389,7 @@ def unpack_invoice_fields(inv, breakdown):
         "opening_balance": float(inv.get("opening_balance") or 0.0),
         "payment_received": float(inv.get("payment_received") or 0.0),
         "balance_carried_forward": float(inv.get("balance_carried_forward") or 0.0),
+        "read_type": inv.get("read_type") or ""
     }
 
     # Build charges_df subset for this invoice
@@ -1422,6 +1425,7 @@ def generate_statement_summary_page(pdf, inv, breakdown, logger, daily, invoice_
     statement_gst_amount = f.get("statement_gst_amount") or f.get("gst_amount")
     charges_df, custom_colors, invoice_number = f["charges_df"], f["custom_colors"], f["invoice_number"]
     statement_opening_balance, statement_payment_received, statement_balance_carried_forward = f["statement_opening_balance"], f["statement_payment_received"], f["statement_balance_carried_forward"]
+    read_type = f["read_type"]
 
     pdf.add_page()
 
@@ -1479,15 +1483,15 @@ def generate_statement_summary_page(pdf, inv, breakdown, logger, daily, invoice_
     y_top = 82; pdf.set_draw_color(0,0,0); pdf.set_line_width(0.35); pdf.line(10, y_top, 190, y_top)
 
     # Left: Account & invoice info
-    pdf.set_xy(10, 83)
+    pdf.set_xy(10, 85)
     write_label_value(pdf, "Customer Number", customer_number, x=10)
     write_label_value(pdf, "Account Number", statement_account_number, x=10)
-    write_label_value(pdf, "Postal Address", postal_address, x=10, wrap=True, force_two_lines=True, value_w=50)
-    write_label_value(pdf, "Purchase Order #", purchase_order, x=10)
+    pdf.ln(4)
+    write_label_value(pdf, "Purchase Order #", purchase_order, x=10, line_height=6)
     if invoice_agg_code is not None and not item_listed_bills:
-        write_label_value(pdf, "Statement No.", statement_number, x=10)
+        write_label_value(pdf, "Statement No.", statement_number, x=10, line_height=6)
     else:
-        write_label_value(pdf, "Tax Invoice No.", statement_number, x=10)
+        write_label_value(pdf, "Tax Invoice No.", statement_number, x=10, line_height=6)
 
     start_dt = pd.to_datetime(start_date, errors="coerce")
     end_dt   = pd.to_datetime(end_date,   errors="coerce")
@@ -1495,13 +1499,13 @@ def generate_statement_summary_page(pdf, inv, breakdown, logger, daily, invoice_
         f"{start_dt.strftime('%d-%b-%y')} to {end_dt.strftime('%d-%b-%y')}"
         if pd.notna(start_dt) and pd.notna(end_dt) else ""
     )
-    write_label_value(pdf, "Billing Cycle", billing_period_lbl, x=10)
+    write_label_value(pdf, "Billing Cycle", billing_period_lbl, x=10, line_height=6)
 
     # Right: Issue/Due/Total
     right_start_x = block_start_x
     label_w_right = label_width
     value_w_right = value_width
-    pdf.set_xy(right_start_x, 83)
+    pdf.set_xy(right_start_x, 85)
     issue_dt = pd.to_datetime(issue_date, errors="coerce")
     due_dt   = pd.to_datetime(due_date,   errors="coerce")
 
@@ -1519,33 +1523,48 @@ def generate_statement_summary_page(pdf, inv, breakdown, logger, daily, invoice_
         align="R", bold_size=10, reg_size=10.5
     )
 
-    pdf.ln(14)
+    pdf.ln(16)
     write_label_value(pdf, 
         "Total Amount Payable", f"${statement_total_in_gst_amount:,.2f}",
         x=right_start_x, label_w=label_w_right, value_w=value_w_right,
         align="R", bold_size=10, reg_size=10.5)
 
     # Divider
-    pdf.ln(10); pdf.set_draw_color(0,0,0); pdf.set_line_width(0.35); pdf.line(10, 120.5, 190, 120.5)
+    pdf.ln(10); pdf.set_draw_color(0,0,0); pdf.set_line_width(0.35); pdf.line(10, 119, 190, 119)
 
     # Gas Account Summary (left)
-    pdf.set_xy(10, 120.5)
-    pdf.set_font("Arial", "I", 8); pdf.cell(50, 8, "This statement is based on usage data provided by network providers", border=0)
-    pdf.set_fill_color(220, 230, 241); pdf.set_xy(10, 126.5)
-    pdf.set_font("Arial", "B", 9); pdf.cell(90.5, 6, "Gas Account Summary", fill=True, new_y=YPos.NEXT)
-    pdf.line(10, 132.5, 100, 132.5)
+    pdf.set_xy(10, 119)
+    if not invoice_agg_code:
+        pdf.set_font("Arial", "I", 8)
+        if read_type is None or str(read_type).strip() == "":
+            msg = "This invoice is based on usage data provided by network providers"
+        elif read_type == "A":
+            msg = "This invoice is based on the actual usage data"
+        elif read_type == "E":
+            msg = "This invoice is based on the estimated usage data"
+        elif read_type == "S":
+            msg = "This invoice is based on the substitute usage data"
+        else:
+            msg = "This invoice is based on usage data provided by network providers"
+        pdf.cell(50, 8, msg, border=0)
+    else:
+        pdf.cell(50, 8, "This invoice is based on usage data provided by network providers", border=0)
 
-    pdf.set_xy(10, 133)
-    pdf.cell(50, 4, "Opening Balance", align='L')
-    pdf.set_font("Arial", "B", 9.5); pdf.cell(40, 4, f"${float(statement_opening_balance):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
-    pdf.cell(50, 4, "Payment received", align='L')
-    pdf.set_font("Arial", "B", 9.5); pdf.cell(40, 4, f"${float(statement_payment_received):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
-    pdf.cell(50, 4, "Balance carried forward", align='L')
-    pdf.set_font("Arial", "B", 9.5); pdf.cell(40, 4, f"${float(statement_balance_carried_forward):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
-    pdf.line(75, 145, 100, 145)
+    pdf.set_fill_color(220, 230, 241); pdf.set_xy(10, 125)
+    pdf.set_font("Arial", "B", 9); pdf.cell(90.5, 6, "Gas Account Summary", fill=True, new_y=YPos.NEXT)
+    pdf.line(10, 131, 100, 131)
+
+    pdf.set_xy(10, 132)
+    pdf.cell(50, 6, "Opening Balance", align='L')
+    pdf.set_font("Arial", "B", 9.5); pdf.cell(40, 6, f"${float(statement_opening_balance):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
+    pdf.cell(50, 6, "Payment received", align='L')
+    pdf.set_font("Arial", "B", 9.5); pdf.cell(40, 6, f"${float(statement_payment_received):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
+    pdf.cell(50, 6, "Balance carried forward", align='L')
+    pdf.set_font("Arial", "B", 9.5); pdf.cell(40, 6, f"${float(statement_balance_carried_forward):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
+    pdf.line(75, 149, 100, 149)
 
     # Current Charges summary
-    pdf.set_xy(10, 146)
+    pdf.set_xy(10, 149.5)
     pdf.set_font("Arial", "BU", 9)
     pdf.cell(80, 6, "Current Charges", border=0); pdf.ln(6)
 
@@ -1591,7 +1610,7 @@ def generate_statement_summary_page(pdf, inv, breakdown, logger, daily, invoice_
     # Footer notes & payments
     pdf.set_xy(10, 202)
     pdf.set_font("Arial", "B", 9)
-    pdf.multi_cell(180, 6, "Agora Retail also operates in the retail natural gas market in Victoria supplying gas to customers who consume over ten terajoule (TJ) of gas per annum.", fill=True)
+    pdf.multi_cell(180, 6, "Agora Retail also operates in the retail natural gas market in Victoria supplying gas to customers who consume over ten terajoules (TJ) of gas per annum.", fill=True)
     pdf.line(10, 217, 190, 217)
 
     if invoice_agg_code is not None and item_listed_bills is None:
@@ -1652,7 +1671,7 @@ def generate_statement_summary_page(pdf, inv, breakdown, logger, daily, invoice_
         pdf.set_x(110)
         pdf.set_font("Arial", "", 7.5)
         pdf.cell(50, 4, "*Surcharge fee may apply to the payment method other than EFT.")
-        pdf.line(10, 257, 190, 257)
+        pdf.line(10, 258.5, 190, 258.5)
     
 
 def generate_invoice_page1(pdf, inv, breakdown, daily, logger):
@@ -1667,6 +1686,7 @@ def generate_invoice_page1(pdf, inv, breakdown, daily, logger):
     charges_df, custom_colors = f["charges_df"], f["custom_colors"]
     contact_number, distributor_name = f["contact_number"], f["distributor_name"]
     opening_balance, payment_received, balance_carried_forward = f["opening_balance"], f["payment_received"], f["balance_carried_forward"]
+    read_type = f["read_type"]
 
     pdf.add_page()
 
@@ -1719,28 +1739,28 @@ def generate_invoice_page1(pdf, inv, breakdown, daily, logger):
     y_top = 82; pdf.set_draw_color(0,0,0); pdf.set_line_width(0.35); pdf.line(10, y_top, 190, y_top)
 
     # Left: Account & invoice info
-    pdf.set_xy(10, 83)
-    write_label_value(pdf, "Customer Number", customer_number, x=10)
-    write_label_value(pdf, "Account Number", acct, x=10)
-    write_label_value(pdf, "Premises Address", premises_address, x=10, wrap=True, value_w=50, force_two_lines=True)
-    write_label_value(pdf, "Purchase Order #", purchase_order, x=10)
+    pdf.set_xy(10, 85)
+    write_label_value(pdf, "Customer Number", customer_number, x=10, line_height=6)
+    write_label_value(pdf, "Account Number", acct, x=10, line_height=6)
+    pdf.ln(4)
+    write_label_value(pdf, "Purchase Order #", purchase_order, x=10, line_height=6)
     if invoice_agg_code is not None and item_listed_bills == "Yes":
-        write_label_value(pdf, "Tax Invoice No.", statement_number, x=10)
+        write_label_value(pdf, "Tax Invoice No.", statement_number, x=10, line_height=6)
     else:
-        write_label_value(pdf, "Tax Invoice No.", invoice_number, x=10)
+        write_label_value(pdf, "Tax Invoice No.", invoice_number, x=10, line_height=6)
     start_dt = pd.to_datetime(start_date, errors="coerce")
     end_dt   = pd.to_datetime(end_date,   errors="coerce")
     billing_period_lbl = (
         f"{start_dt.strftime('%d-%b-%y')} to {end_dt.strftime('%d-%b-%y')}"
         if pd.notna(start_dt) and pd.notna(end_dt) else ""
     )
-    write_label_value(pdf, "Billing Cycle", billing_period_lbl, x=10)
+    write_label_value(pdf, "Billing Cycle", billing_period_lbl, x=10, line_height=6)
 
     # Right: Issue/Due/Total
     right_start_x = block_start_x
     label_w_right = label_width
     value_w_right = value_width
-    pdf.set_xy(right_start_x, 83)
+    pdf.set_xy(right_start_x, 85)
     issue_dt = pd.to_datetime(issue_date, errors="coerce")
     due_dt   = pd.to_datetime(due_date,   errors="coerce")
 
@@ -1764,27 +1784,40 @@ def generate_invoice_page1(pdf, inv, breakdown, daily, logger):
         x=right_start_x, label_w=label_w_right, value_w=value_w_right,
         align="R", bold_size=10, reg_size=10.5)
 
-    # Divider
-    pdf.ln(10); pdf.set_draw_color(0,0,0); pdf.set_line_width(0.35); pdf.line(10, 120.5, 190, 120.5)
+   # Divider
+    pdf.ln(10); pdf.set_draw_color(0,0,0); pdf.set_line_width(0.35); pdf.line(10, 119, 190, 119)
 
     # Gas Account Summary (left)
-    pdf.set_xy(10, 120.5)
-    pdf.set_font("Arial", "I", 8); pdf.cell(50, 8, "This invoice is based on usage data provided by network providers", border=0)
-    pdf.set_fill_color(220, 230, 241); pdf.set_xy(10, 126.5)
+    if not invoice_agg_code:
+        pdf.set_font("Arial", "I", 8)
+        if read_type is None or str(read_type).strip() == "":
+            msg = "This invoice is based on usage data provided by network providers"
+        elif read_type == "A":
+            msg = "This invoice is based on the actual usage data"
+        elif read_type == "E":
+            msg = "This invoice is based on the estimated usage data"
+        elif read_type == "S":
+            msg = "This invoice is based on the substitute usage data"
+        else:
+            msg = "This invoice is based on usage data provided by network providers"
+        pdf.cell(50, 8, msg, border=0)
+    else:
+        pdf.cell(50, 8, "This invoice is based on usage data provided by network providers", border=0)
+    pdf.set_fill_color(220, 230, 241); pdf.set_xy(10, 125)
     pdf.set_font("Arial", "B", 9); pdf.cell(90.5, 6, "Gas Account Summary", fill=True, new_y=YPos.NEXT)
-    pdf.line(10, 132.5, 100, 132.5)
+    pdf.line(10, 131, 100, 131)
 
-    pdf.set_xy(10, 133)
-    pdf.cell(50, 4, "Opening Balance", align='L')
-    pdf.set_font("Arial", "B", 9.5); pdf.cell(40, 4, f"${float(opening_balance):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
-    pdf.cell(50, 4, "Payment received", align='L')
-    pdf.set_font("Arial", "B", 9.5); pdf.cell(40, 4, f"${float(payment_received):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
-    pdf.cell(50, 4, "Balance carried forward", align='L')
-    pdf.set_font("Arial", "B", 9.5); pdf.cell(40, 4, f"${float(balance_carried_forward):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
-    pdf.line(75, 145, 100, 145)
+    pdf.set_xy(10, 132)
+    pdf.cell(50, 6, "Opening Balance", align='L')
+    pdf.set_font("Arial", "B", 9.5); pdf.cell(40, 6, f"${float(opening_balance):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
+    pdf.cell(50, 6, "Payment received", align='L')
+    pdf.set_font("Arial", "B", 9.5); pdf.cell(40, 6, f"${float(payment_received):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
+    pdf.cell(50, 6, "Balance carried forward", align='L')
+    pdf.set_font("Arial", "B", 9.5); pdf.cell(40, 6, f"${float(balance_carried_forward):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
+    pdf.line(75, 149, 100, 149)
 
     # Current Charges summary
-    pdf.set_xy(10, 146)
+    pdf.set_xy(10, 149.5)
     pdf.set_font("Arial", "BU", 9)
     pdf.cell(80, 6, "Current Charges", border=0); pdf.ln(6)
 
@@ -1834,7 +1867,7 @@ def generate_invoice_page1(pdf, inv, breakdown, daily, logger):
     pdf.set_fill_color(220, 230, 241)
     pdf.set_xy(10, 202)
     pdf.set_font("Arial", "B", 9)
-    pdf.multi_cell(180, 6, "Agora Retail also operates in the retail natural gas market in Victoria supplying gas to customers who consume over ten terajoule (TJ) of gas per annum.", fill=True)
+    pdf.multi_cell(180, 6, "Agora Retail also operates in the retail natural gas market in Victoria supplying gas to customers who consume over ten terajoules (TJ) of gas per annum.", fill=True)
     pdf.line(10, 217, 190, 217)
 
     # EFT Block (Left)
@@ -1867,7 +1900,7 @@ def generate_invoice_page1(pdf, inv, breakdown, daily, logger):
     pdf.set_x(110)
     pdf.set_font("Arial", "", 7.5)
     pdf.cell(50, 4, "*Surcharge fee may apply to the payment method other than EFT.")
-    pdf.line(10, 257, 190, 257)
+    pdf.line(10, 258.5, 190, 258.5)
 
 
 def generate_invoice_page2(pdf, inv, breakdown, daily, basic, logger):
@@ -1903,8 +1936,8 @@ def generate_invoice_page2(pdf, inv, breakdown, daily, basic, logger):
 
     pdf.add_page()
 
-    label_width_left = 42
-    label_width_right = 35
+    label_width_left = 40
+    label_width_right = 33.5
     left_x = 10
     right_x = 105
     right_value_width = 50
@@ -1930,7 +1963,11 @@ def generate_invoice_page2(pdf, inv, breakdown, daily, basic, logger):
 
     # Billing Details (Right Block)
     pdf.set_xy(right_x, 35)
-    read_period_with_days = f"{read_period} ({billing_days} days)"
+    billing_days = _to_int_or_none(billing_days)
+    if billing_days == 0:
+        read_period_with_days = f"No meter read data ({billing_days} days)"
+    else:
+        read_period_with_days = f"{read_period} ({billing_days} days)"
     write_label_value(pdf, "Read Period", read_period_with_days, x=105, label_w=label_width_right, value_w=right_value_width)
     write_label_value(pdf, "Distributor", distributor_name, x=105, label_w=label_width_right, value_w=right_value_width)
     write_label_value(pdf, "Meter Number", meter_number, x=105, label_w=label_width_right, value_w=right_value_width)
@@ -2143,7 +2180,11 @@ def generate_invoice_page2(pdf, inv, breakdown, daily, basic, logger):
     if stack_consumption_chart == "Yes":
         # Sum all retail_mdq for this customer_number
         aggregated_contract_mdq = (
-            daily.loc[daily["customer_number"] == customer_number, "retail_mdq"]
+            daily.loc[
+                (daily["customer_number"] == customer_number)
+                & (daily["stack_consumption_chart"] == "Yes"),
+                "retail_mdq"
+            ]            
             .dropna()
             .astype(float)
             .unique()
@@ -2161,20 +2202,20 @@ def generate_invoice_page2(pdf, inv, breakdown, daily, basic, logger):
         interval_type = (interval_metering or "").strip()
 
         if not interval_type.startswith("Basic"):
-            # === Comment above Consumption Chart (Right) ===
-            pdf.set_font("Arial", "BU", 8)
-            if monthly_mdq > contract_mdq:
-                if spot_gas_amount == 0:
-                    pdf.set_xy(137, 145)
-                    pdf.cell(100, 4, "No Overrun Charges, as this MIRN", ln=1)
-                    pdf.set_xy(137, 149)
-                    pdf.cell(100, 4, "is a part of Aggregated portfolio", ln=1)
+            # # === Comment above Consumption Chart (Right) ===
+            # pdf.set_font("Arial", "BU", 8)
+            # if monthly_mdq > contract_mdq:
+            #     if spot_gas_amount == 0:
+            #         pdf.set_xy(137, 145)
+            #         pdf.cell(100, 4, "No Overrun Charges, as this MIRN", ln=1)
+            #         pdf.set_xy(137, 149)
+            #         pdf.cell(100, 4, "is a part of Aggregated portfolio", ln=1)
 
-                else:
-                    pdf.set_xy(137, 145)
-                    pdf.cell(100, 4, "Spot Gas Sales & Transport Charges", ln=1)
-                    pdf.set_xy(137, 149)
-                    pdf.cell(100, 4, "are billed as a separate line item", ln=1)
+            #     else:
+            #         pdf.set_xy(137, 145)
+            #         pdf.cell(100, 4, "Spot Gas Sales & Transport Charges", ln=1)
+            #         pdf.set_xy(137, 149)
+            #         pdf.cell(100, 4, "are billed as a separate line item", ln=1)
 
             # === MDQ box above Consumption Chart ===
             pdf.set_xy(10, 145)
