@@ -25,6 +25,7 @@ import time
 import random
 import hashlib
 from dataclasses import dataclass, field
+import math
 #from dotenv import load_dotenv
 
 # =========================
@@ -1036,9 +1037,16 @@ def _fetch_statement_variants(engine, base_statement_number: str) -> List[Tuple[
 def _strip_pdf_ext(name: str) -> str:
     return name[:-4] if isinstance(name, str) and name.lower().endswith(".pdf") else name
 
-def _money2(x) -> Decimal:
-    # stable cents rounding (avoids float noise)
-    return Decimal(str(x)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+def _money2(x):
+    if x is None:
+        return None
+    try:
+        xf = float(x)
+        if math.isnan(xf) or math.isinf(xf):
+            return None
+        return round(xf, 2)
+    except Exception:
+        return None
 
 def build_statement_content_hash(
     invoices: Iterable[Tuple[str, float]]
@@ -1108,9 +1116,10 @@ def _db_get_statement_signature(engine, stmt_no: str) -> Dict[str, Any]:
     stmt_totals = []
     for inv_no, inv_total, stmt_total in rows:
         if inv_no:
-            invoices.append((str(inv_no).strip(), float(inv_total or 0.0)))
+            inv_no_s = _norm_id(inv_no)
+            invoices.append((inv_no_s, round(float(inv_total or 0.0), 2)))
         if stmt_total is not None:
-            stmt_totals.append(float(stmt_total))
+            stmt_totals.append(round(float(stmt_total), 2))
 
     sig = {
         "content_hash": build_statement_content_hash(invoices),
@@ -1118,6 +1127,30 @@ def _db_get_statement_signature(engine, stmt_no: str) -> Dict[str, Any]:
         "total": max(stmt_totals) if stmt_totals else None,
     }
     return sig
+
+def _root_base(stmt: str) -> str:
+    """
+    Only strips a duplicate suffix like _2 or _10.
+    Will NOT strip account numbers like _30013.
+    """
+    s = (stmt or "").strip()
+    parts = s.split("_")
+    if len(parts) >= 4 and parts[-1].isdigit() and len(parts[-1]) <= 3:
+        # Only treat as suffix if previous segment looks like an account number
+        if parts[-2].isdigit() and len(parts[-2]) >= 4:
+            return "_".join(parts[:-1])
+    return s
+
+def _norm_id(x) -> str:
+    if x is None:
+        return ""
+    s = str(x).strip()
+
+    # pandas float artifact: "30013.0" -> "30013"
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
+
+    return s
 
 def should_process_statement(
     eng,
@@ -1131,13 +1164,17 @@ def should_process_statement(
 ) -> Tuple[bool, str]:
 
     logger = logger or logging.getLogger(__name__)
-    base = (statement_number or "").strip()
-    if not base:
-        return True, base
+
+    base_in = (statement_number or "").strip()
+    if not base_in:
+        return True, base_in
+
+    root = _root_base(base_in)
 
     # ---- prevent re-suffixing in same run ----
-    if run_cache and base in run_cache.chosen_name_by_base:
-        chosen = run_cache.chosen_name_by_base[base]
+    # Use ROOT as the key so TRI_... and TRI_..._2 share one decision.
+    if run_cache and root in run_cache.chosen_name_by_base:
+        chosen = run_cache.chosen_name_by_base[root]
         if chosen in run_cache.emitted:
             return False, chosen
         run_cache.emitted.add(chosen)
@@ -1146,127 +1183,46 @@ def should_process_statement(
     curr_total = _money2(statement_total_in_gst_amount)
     curr_hash = content_hash or f"TOTAL:{curr_total}"
 
-    # DB variants
-    variants = _db_list_statement_variants(eng, base)
+    # DB variants (scan using ROOT)
+    db_variants = _db_list_statement_variants(eng, root)
 
-    # SP variants (optional but helps when PDFs exist but history missing)
+    # SP variants (scan using ROOT)
+    sp_variants = []
     if sp_index:
         try:
-            variants += sp_index.list_variants_stem(base)  # returns ["STMT", "STMT_2", ...]
+            sp_variants = sp_index.list_variants_stem(root)  # must be ["ROOT", "ROOT_2", ...]
         except Exception as e:
-            logger.warning(f"SharePoint variant scan failed for {base}: {e}")
+            logger.warning(f"SharePoint variant scan failed for {root}: {e}")
 
-    # unique, stable order by suffix
-    variants = sorted(set(v for v in variants if v), key=lambda v: (_suffix_num(base, v), v))
-
-    # ---- match? skip ----
-    for v in variants:
+    # Use DB variants ONLY for equality/skip checks
+    # IMPORTANT: suffix parsing must also be relative to ROOT
+    for v in sorted(set(db_variants), key=lambda v: (_suffix_num(root, v), v)):
         meta = _db_get_statement_signature(eng, v) or {}
         prev_hash = meta.get("content_hash")
         prev_total = meta.get("total")
 
-        # best check: hash
         if content_hash is not None and prev_hash and prev_hash == curr_hash:
             logger.info(f"⏭️ Statement {v} already exists with same invoice composition; skipping.")
             return False, v
 
-        # fallback: total match (covers cases where DB lacks enough detail)
         if prev_total is not None and _money2(prev_total) == curr_total:
             logger.info(f"⏭️ Statement {v} already exists with same total; skipping.")
             return False, v
 
-    # ---- choose suffix if something exists ----
-    if variants:
-        max_sfx = max(_suffix_num(base, v) for v in variants)
-        chosen = f"{base}_2" if max_sfx == 0 else f"{base}_{max_sfx + 1}"
+    # Use BOTH DB + SP variants ONLY to choose next suffix (relative to ROOT)
+    all_variants = sorted(set(db_variants + sp_variants), key=lambda v: (_suffix_num(root, v), v))
+    if all_variants:
+        max_sfx = max(_suffix_num(root, v) for v in all_variants)
+        chosen = f"{root}_2" if max_sfx == 0 else f"{root}_{max_sfx + 1}"
     else:
-        chosen = base
+        chosen = root
 
     if run_cache:
-        run_cache.chosen_name_by_base[base] = chosen
+        run_cache.chosen_name_by_base[root] = chosen
         run_cache.emitted.add(chosen)
 
     logger.info(f"✅ Will process statement {chosen} (new or changed).")
     return True, chosen
-
-# def should_process_statement(
-#     eng,
-#     statement_number: str,
-#     statement_total_in_gst_amount: float,
-#     *,
-#     content_hash: Optional[str] = None,
-#     run_cache: Optional[StatementRunCache] = None,
-# ) -> Tuple[bool, str]:
-#     """
-#     Returns: (process_bool, statement_number_to_use)
-
-#     Key rule for consolidated statements:
-#       - Only increment suffix if statement_number already exists AND the *invoice content* changed.
-#       - Use content_hash for that. (For non-consolidated, you can pass None and it falls back to total.)
-#     """
-
-#     base = (statement_number or "").strip()
-#     if not base:
-#         return True, base
-
-#     # ---- Prevent repeated suffixing in the same run for consolidated groups ----
-#     if run_cache and base in run_cache.chosen_name_by_base:
-#         chosen = run_cache.chosen_name_by_base[base]
-#         if chosen in run_cache.emitted:
-#             return False, chosen
-#         run_cache.emitted.add(chosen)
-#         return True, chosen
-
-#     curr_total = _money2(statement_total_in_gst_amount)
-#     curr_key = content_hash or f"TOTAL:{curr_total}"
-
-#     # -------------------------
-#     # Gather existing variants (DB is the source of truth for "what variants exist")
-#     # -------------------------
-#     variants = _db_list_statement_variants(eng, base)
-
-#     # Also consider SharePoint base.pdf existence as “variant exists” even if DB is missing
-#     try:
-#         if sp_index.exists(f"{base}.pdf") and base not in variants:
-#             variants = [base] + variants
-#     except Exception as e:
-#         logger.warning(f"SharePoint check failed for {base}: {e}. Continuing with DB only.")
-
-#     # -------------------------
-#     # If ANY existing variant matches current content -> SKIP
-#     # -------------------------
-#     for v in variants:
-#         meta = _db_get_statement_meta(eng, v) or {}
-#         prev_hash = meta.get("content_hash")
-#         prev_total = meta.get("total")
-
-#         if prev_hash and prev_hash == curr_key:
-#             logger.info(f"⏭️ Statement {v} already exists with same content; skipping.")
-#             return False, base
-
-#         # fallback compatibility if you haven't stored hashes yet
-#         if content_hash is None and prev_total is not None and _money2(prev_total) == curr_total:
-#             logger.info(f"⏭️ Statement {v} already exists with same total; skipping.")
-#             return False, base
-
-#     # -------------------------
-#     # No match found -> choose next suffix ONLY if something already exists
-#     # -------------------------
-#     if variants:
-#         max_sfx = max(_suffix_num(base, v) for v in variants)
-#         chosen = f"{base}_{max_sfx + 2}" if max_sfx == 0 else f"{base}_{max_sfx + 1}"
-#         # Explanation:
-#         #   base exists => max_sfx=0 => next should be base_2
-#         #   base_2 exists => max_sfx=2 => next should be base_3
-#     else:
-#         chosen = base
-
-#     if run_cache:
-#         run_cache.chosen_name_by_base[base] = chosen
-#         run_cache.emitted.add(chosen)
-
-#     logger.info(f"✅ Will process statement {chosen} (content changed or new).")
-#     return True, chosen
 
 def _apply_history_increment_rule(engine, row: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str, bool]:
     """
@@ -2789,6 +2745,11 @@ def main():
     sp_handler = SharePointLogHandler(sp, log_filename)
     sp_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
     logger.addHandler(sp_handler)
+    # ---- ALSO log to console (Azure Functions / local host output) ----
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logger.addHandler(console_handler)
 
     logger.info("=============== Starting PDF generation with charts ===============")
 
@@ -2823,26 +2784,30 @@ def main():
         inv_totals_df = (
             statement_group[["invoice_number", "total_in_gst_amount"]]
             .dropna(subset=["invoice_number"])
-            .assign(invoice_number=lambda d: d["invoice_number"].astype(str).str.strip())
+            .assign(
+                invoice_number=lambda d: d["invoice_number"].map(_norm_id),
+                total_in_gst_amount=lambda d: d["total_in_gst_amount"].astype(float).round(2),
+            )
             .groupby("invoice_number", as_index=False)["total_in_gst_amount"]
             .sum()
         )
 
         invoice_pairs = list(zip(inv_totals_df["invoice_number"], inv_totals_df["total_in_gst_amount"]))
+        total_statement_amount = float(inv_totals_df["total_in_gst_amount"].sum().round(2))
 
-        # 2) Statement total (sum of invoice totals)
-        total_statement_amount = float(inv_totals_df["total_in_gst_amount"].sum())
+        # IMPORTANT: sort for stability
+        invoice_pairs = sorted(invoice_pairs, key=lambda t: t[0])
 
-        # 3) Content hash (THIS is what makes consolidated logic correct)
         content_hash = build_statement_content_hash(invoice_pairs)
 
-        # 4) Call the new signature (content_hash + run_cache)
         process, final_statement_number = should_process_statement(
             eng,
             original_statement_number,
             total_statement_amount,
             content_hash=content_hash,
-            run_cache=stmt_run_cache
+            run_cache=stmt_run_cache,
+            sp_index=sp_index,
+            logger=logger
         )
 
         if not process:
@@ -2853,17 +2818,19 @@ def main():
 
         pdf = PDF()
         pdf.alias_nb_pages()
+        invoices_emitted = 0
+        summary_added = False
 
         # IMPORTANT: inject final_statement_number into the statement row BEFORE PDF generation
-        first_row = statement_group.iloc[0].copy()
-        first_row["statement_number"] = final_statement_number
-        invoice_numbers = (
-            statement_group["invoice_number"]
-            .dropna()
-            .astype(str)
-            .tolist()
-        )
-        generate_statement_summary_page(pdf, first_row, breakdown, logger, daily, invoice_numbers, headers)
+        # first_row = statement_group.iloc[0].copy()
+        # first_row["statement_number"] = final_statement_number
+        # invoice_numbers = (
+        #     statement_group["invoice_number"]
+        #     .dropna()
+        #     .astype(str)
+        #     .tolist()
+        # )
+        # generate_statement_summary_page(pdf, first_row, breakdown, logger, daily, invoice_numbers, headers)
 
         # ---- For each invoice in this statement ----
         for _, inv in statement_group.iterrows():
@@ -2878,6 +2845,20 @@ def main():
                 skipped_duplicates += 1
                 logger.info(f"Duplicate invoice with same total: {invoice_number}; skipping.")
                 continue
+
+            if not summary_added:
+                first_row = statement_group.iloc[0].copy()
+                first_row["statement_number"] = final_statement_number
+
+                invoice_numbers = (
+                    statement_group["invoice_number"]
+                    .dropna()
+                    .astype(str)
+                    .tolist()
+                )
+
+            generate_statement_summary_page(pdf, first_row, breakdown, logger, daily, invoice_numbers, headers)
+            summary_added = True
             
             inv["invoice_number"] = invoice_number
 
@@ -2889,14 +2870,20 @@ def main():
 
             # Page 2 always
             generate_invoice_page2(pdf, inv, breakdown, daily, basic, logger)
-
+            invoices_emitted += 1
+    
             # Insert invoice history
             if r2 is not None and do_insert:
                 insert_billing_history_batch(eng, [r2])
                 logger.info(f"Inserted history for {invoice_number}")
-
+            
         # ---- Save statement PDF with **incremented name** ----
-        pdf_filename = f"{final_statement_number}_Generated_{GENERATE_DATE}.pdf"
+        if invoices_emitted == 0:
+            logger.info(f"⏭️ Statement {final_statement_number} produced 0 new invoices; skipping PDF upload.")
+            continue
+
+        generated_ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+        pdf_filename = f"{final_statement_number}_Generated_{generated_ts}.pdf"
 
         pdf_content = pdf.output(dest="S")  # returns a str in fpdf2
         if isinstance(pdf_content, str):

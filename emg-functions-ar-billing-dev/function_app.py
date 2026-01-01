@@ -17,21 +17,16 @@ app = func.FunctionApp()
 # --------------------------
 MODE = os.getenv("BILLING_MODE", "production").lower()
 
-# if MODE == "local":
-#     # Local testing schedule: every 1 minute for local testing
-#     cron_schedule = "0 */2 * * * *"
-#     monitor_flag = False
-# el
 if MODE == "testing":
     # Cloud testing schedule: 5 AM AEST on the 2nd, 8 AM PERTH time
-    cron_schedule = "0 0 5 2 * *"
+    cron_schedule = "0 0 5 2 12 *" # sec min hour day month dow 
     monitor_flag = True
 elif MODE == "production":
     # Production schedule: # 5 AM AEST on the 2nd, 8 AM PERTH time
     cron_schedule = "0 0 5 2 * *"
     monitor_flag = True
 else:
-    cron_schedule = "0 0 5 2 * *" # default to prod
+    cron_schedule = "0 0 5 2 12 *" # default to prod
     monitor_flag = False
 
 logging.warning(f"Billing Function starting in {MODE.upper()} mode with schedule: {cron_schedule}")
