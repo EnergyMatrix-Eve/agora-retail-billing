@@ -507,7 +507,8 @@ def sanitize_history_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "statement_total_amount":          _to_float_or_none(r.get("statement_total_amount")),
             "statement_gst_amount":            _to_float_or_none(r.get("statement_gst_amount")),
             "statement_total_in_gst_amount":   _to_float_or_none(r.get("statement_total_in_gst_amount")),
-
+            "total_amount_payable":            _to_float_or_none(r.get("total_amount_payable")),
+            "statement_total_amount_payable":   _to_float_or_none(r.get("statement_total_amount_payable")),
             # System field
             "generated_at_utc":                _to_datetime_or_none(r.get("generated_at_utc") or datetime.utcnow()),
         }
@@ -993,19 +994,19 @@ def _fetch_history_variants(engine, base_invoice_number: str) -> List[Tuple[str,
     Only rows where invoice_number == base OR base_\\d+ are kept.
     """
     like = base_invoice_number + "%"
-    sql = f"SELECT invoice_number, total_in_gst_amount FROM {HISTORY_TABLE} WHERE invoice_number LIKE ?"
+    sql = f"SELECT invoice_number, total_amount_payable FROM {HISTORY_TABLE} WHERE invoice_number LIKE ?"
     pat = re.compile(r"^" + re.escape(base_invoice_number) + r"(?:_(\d+))?$")
 
     with engine.begin() as con:
         rows = con.exec_driver_sql(sql, (like,)).fetchall()
 
     variants: List[Tuple[str, int, Decimal]] = []
-    for inv, total_in_gst_amount in rows:
+    for inv, total_amount_payable in rows:
         m = pat.match(inv or "")
         if not m:
             continue
         sfx = int(m.group(1) or "1")  # base counted as 1
-        variants.append((inv, sfx, _norm2(total_in_gst_amount)))
+        variants.append((inv, sfx, _norm2(total_amount_payable)))
     return variants
 
 def _fetch_statement_variants(engine, base_statement_number: str) -> List[Tuple[str, int, Decimal]]:
@@ -1015,7 +1016,7 @@ def _fetch_statement_variants(engine, base_statement_number: str) -> List[Tuple[
     """
     like = base_statement_number + "%"
     sql = f"""
-        SELECT statement_number, total_in_gst_amount
+        SELECT statement_number, total_amount_payable
         FROM {HISTORY_TABLE}
         WHERE statement_number LIKE ?
     """
@@ -1025,12 +1026,12 @@ def _fetch_statement_variants(engine, base_statement_number: str) -> List[Tuple[
         rows = con.exec_driver_sql(sql, (like,)).fetchall()
 
     variants: List[Tuple[str, int, Decimal]] = []
-    for st_no, total_in_gst_amount in rows:
+    for st_no, total_amount_payable in rows:
         m = pat.match(st_no or "")
         if not m:
             continue
         sfx = int(m.group(1) or "1")   # base counted as 1
-        variants.append((st_no, sfx, _norm2(total_in_gst_amount)))
+        variants.append((st_no, sfx, _norm2(total_amount_payable)))
 
     return variants
 
@@ -1085,7 +1086,7 @@ def _db_list_statement_variants(engine, base: str) -> List[str]:
 def _db_get_statement_meta(engine, stmt_no: str) -> Dict[str, Any]:
     # if you DON'T have content_hash column yet, just return total
     sql = f"""
-        SELECT TOP 1 statement_total_in_gst_amount
+        SELECT TOP 1 statement_total_amount_payable
         FROM {HISTORY_TABLE}
         WHERE statement_number = ?
         ORDER BY generated_at_utc DESC
@@ -1102,7 +1103,7 @@ def _db_get_statement_signature(engine, stmt_no: str) -> Dict[str, Any]:
     This avoids needing a content_hash column.
     """
     sql = f"""
-        SELECT invoice_number, total_in_gst_amount, statement_total_in_gst_amount
+        SELECT invoice_number, total_amount_payable, statement_total_amount_payable
         FROM {HISTORY_TABLE}
         WHERE statement_number = ?
     """
@@ -1155,7 +1156,7 @@ def _norm_id(x) -> str:
 def should_process_statement(
     eng,
     statement_number: str,
-    statement_total_in_gst_amount: float,
+    statement_total_amount_payable: float,
     *,
     content_hash: Optional[str] = None,
     run_cache: Optional[StatementRunCache] = None,
@@ -1180,7 +1181,7 @@ def should_process_statement(
         run_cache.emitted.add(chosen)
         return True, chosen
 
-    curr_total = _money2(statement_total_in_gst_amount)
+    curr_total = _money2(statement_total_amount_payable)
     curr_hash = content_hash or f"TOTAL:{curr_total}"
 
     # DB variants (scan using ROOT)
@@ -1237,9 +1238,7 @@ def _apply_history_increment_rule(engine, row: Dict[str, Any]) -> Tuple[Optional
     if not base:
         return None, "", False
 
-    curr_total_in_gst_amount = row.get("total_in_gst_amount")
-    if curr_total_in_gst_amount is None:
-        curr_total_in_gst_amount = (float(row.get("total_amount") or 0) + float(row.get("gst_amount") or 0))
+    curr_total_in_gst_amount = row.get("total_amount_payable")
     curr_norm = _norm2(curr_total_in_gst_amount)
 
     variants = _fetch_history_variants(engine, base)
@@ -1324,6 +1323,8 @@ def insert_billing_history_batch(engine, rows: List[Dict[str, Any]]) -> List[str
         "statement_total_amount",
         "statement_gst_amount",
         "statement_total_in_gst_amount",
+        "total_amount_payable",
+        "statement_total_amount_payable",
 
         # System field
         "generated_at_utc",
@@ -1684,7 +1685,9 @@ def unpack_invoice_fields(inv, breakdown):
         "opening_balance": float(inv.get("opening_balance") or 0.0),
         "payment_received": float(inv.get("payment_received") or 0.0),
         "balance_carried_forward": float(inv.get("balance_carried_forward") or 0.0),
-        "read_type": inv.get("read_type") or ""
+        "read_type": inv.get("read_type") or "",
+        "total_amount_payable": inv.get("total_amount_payable"),
+        "statement_total_amount_payable": inv.get("statement_total_amount_payable")
     }
 
     # Build charges_df subset for this invoice
@@ -1722,6 +1725,7 @@ def generate_statement_summary_page(pdf, inv, breakdown, logger, daily, invoice_
     statement_opening_balance, statement_payment_received, statement_balance_carried_forward = f["statement_opening_balance"], f["statement_payment_received"], f["statement_balance_carried_forward"]
     read_type = f["read_type"]
     interval_metering = f["interval_metering"]
+    statement_total_amount_payable = f["statement_total_amount_payable"]
 
     pdf.add_page()
 
@@ -1821,7 +1825,7 @@ def generate_statement_summary_page(pdf, inv, breakdown, logger, daily, invoice_
 
     pdf.ln(16)
     write_label_value(pdf, 
-        "Total Amount Payable", f"${statement_total_in_gst_amount:,.2f}",
+        "Total Amount Payable", f"${statement_total_amount_payable:,.2f}",
         x=right_start_x, label_w=label_w_right, value_w=value_w_right,
         align="R", bold_size=10, reg_size=10.5)
 
@@ -1983,6 +1987,7 @@ def generate_invoice_page1(pdf, inv, breakdown, daily, logger):
     opening_balance, payment_received, balance_carried_forward = f["opening_balance"], f["payment_received"], f["balance_carried_forward"]
     read_type = f["read_type"]
     interval_metering = f["interval_metering"]
+    total_amount_payable = f["total_amount_payable"]
 
     pdf.add_page()
 
@@ -2076,7 +2081,7 @@ def generate_invoice_page1(pdf, inv, breakdown, daily, logger):
 
     pdf.ln(14)
     write_label_value(pdf, 
-        "Total Amount Payable", f"${total_in_gst_amount:,.2f}",
+        "Total Amount Payable", f"${total_amount_payable:,.2f}",
         x=right_start_x, label_w=label_w_right, value_w=value_w_right,
         align="R", bold_size=10, reg_size=10.5)
 
