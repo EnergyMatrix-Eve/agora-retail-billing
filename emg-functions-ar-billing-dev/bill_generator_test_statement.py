@@ -1877,8 +1877,11 @@ def generate_statement_summary_page(pdf, inv, breakdown, logger, daily, invoice_
     ]
 
     s_for_pie_cat_statement = (
-        charges_df.groupby("Charge Category")["Statement Amount ex GST"]
-                    .apply(lambda s: pd.to_numeric(s, errors="coerce").fillna(0.0).sum())
+        charges_df.assign(
+            amt=pd.to_numeric(charges_df["Statement Amount ex GST"], errors="coerce").fillna(0.0)
+        )
+        .groupby("Charge Category")["amt"]
+        .apply(lambda s: s.drop_duplicates().sum())
     )
 
     s_for_pie_cat_statement = s_for_pie_cat_statement[s_for_pie_cat_statement > 0]
@@ -2210,7 +2213,6 @@ def generate_invoice_page2(pdf, inv, breakdown, daily, basic, logger):
     invoice_number = f["invoice_number"]
     acct, mirn, transmission_pipeline = f["acct"], f["mirn"], f["transmission_pipeline"]
     distributor_name, distributor_mhq = f["distributor_name"], f["distributor_mhq"]
-
     start_date_dt = pd.to_datetime(f["start_date"], errors="coerce")
     end_date_dt = pd.to_datetime(f["end_date"], errors="coerce")
 
@@ -2696,10 +2698,15 @@ def generate_invoice_page2(pdf, inv, breakdown, daily, basic, logger):
     pdf.set_font("Arial", "", 7)
     text1 = "* Agora Retail will reconcile Network Charges for this month against the actual charges invoiced by the Network Operator and the adjustment charges will be applied accordingly on the next invoice."
     text2 = "* gasTrading Spot Prices are published on the website: https://gastrading.com.au/spot-market/historical-prices-and-volume/bid-and-scheduled"
+    text2026011 = "* The Australian Bureau of Statistics (ABS) has re-referenced the Sep'25 CPI index to 100.00 and aligned it with the new monthly CPI series."
+    text2026012 = "* Under the terms of your contract, the Agora Firm Gas Consumption Price is adjusted on a quarterly basis. For Q1 2026 invoices, the applicable firm gas rate is calculated by taking the Dec'25 Firm Gas Consumption Price and escalated by the CPI movement from Sep'25 (index value 100.00) to Dec'25 (index value 100.97), based on the CPI index for the 8 Capital Cities."
     text3 = f"* {str(charge_notes).strip()}" if (pd.notna(charge_notes) and str(charge_notes).strip()) else ""
 
     pdf.multi_cell(180, 4, text1, border=0, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.multi_cell(180, 4, text2, border=0, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    if acct in {30001, 30002, 30003, 30007, 30008, 30009, 30010, 30011, 30013, 30015}:
+        pdf.multi_cell(180, 4, text2026011, border=0, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.multi_cell(180, 4, text2026012, border=0, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.multi_cell(180, 4, text3, border=0)
 
     box_bottom = pdf.get_y()
