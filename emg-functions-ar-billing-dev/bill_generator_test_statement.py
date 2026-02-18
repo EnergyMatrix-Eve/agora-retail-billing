@@ -1,8 +1,11 @@
 import os
 import logging
+import io
 from io import BytesIO, StringIO
 import numpy as np
 import pandas as pd
+import matplotlib
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from fpdf import FPDF
@@ -16,7 +19,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple, Iterable
 import matplotlib as mpl
 from matplotlib.font_manager import FontProperties
-from fpdf.enums import XPos, YPos
+from fpdf.enums import XPos, YPos, MethodReturnValue
 from sqlalchemy import create_engine
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 import msal
@@ -92,64 +95,57 @@ def _status_code_from_sp_exception(e: Exception) -> int | None:
 TRANSIENT_STATUS = {429, 500, 502, 503, 504}
 
 class SharePointLogHandler(logging.Handler):
-    def __init__(self, sp, remote_filename: str, flush_every: int = 50, flush_seconds: int = 10):
+    def __init__(
+        self,
+        sp,
+        remote_filename: str,
+        upload_every_bytes: int = 512 * 1024,     # 512KB
+        max_remote_bytes: int = 10 * 1024 * 1024  # 10MB kept remotely
+    ):
         super().__init__()
         self.sp = sp
         self.remote_filename = remote_filename
-        self.buffer = StringIO()
-        self.flush_every = flush_every
-        self.flush_seconds = flush_seconds
-        self._line_count = 0
-        self._last_flush = time.time()
-        self.remote_filename = os.path.basename(remote_filename)
 
-        # ✅ ensure file exists in SharePoint folder (create empty if missing)
-        try:
-            existing = self.sp.download_bytes(self.remote_filename)
-            if existing:
-                try:
-                    self.buffer.write(existing.decode("utf-8"))
-                except Exception:
-                    pass
-            else:
-                self.sp.upload_bytes(self.remote_filename, b"")  # creates it
-        except Exception as e:
-            logging.warning(f"Log init failed ({self.remote_filename}): {e}")
+        self.upload_every_bytes = upload_every_bytes
+        self.max_remote_bytes = max_remote_bytes
 
-        try:
-            existing = self.sp.download_bytes(remote_filename)
-        except ClientRequestException as e:
-            # if anything slips through, do not fail the whole function
-            logging.warning(f"Log file not readable yet ({remote_filename}): {e}")
-            existing = None
-
-        if existing:
-            try:
-                self.buffer.write(existing.decode("utf-8"))
-            except Exception:
-                pass
+        self.buffer = io.StringIO()
+        self._bytes_since_upload = 0
 
     def emit(self, record):
-        msg = self.format(record)
-        self.buffer.write(msg + "\n")
-        self._line_count += 1
+        try:
+            msg = self.format(record)
+            line = msg + "\n"
+            self.buffer.write(line)
+            self._bytes_since_upload += len(line.encode("utf-8"))
 
-        now = time.time()
-        if self._line_count >= self.flush_every or (now - self._last_flush) >= self.flush_seconds:
-            self.flush()
+            # flush only when big enough
+            if self._bytes_since_upload >= self.upload_every_bytes:
+                self.flush()
+        except Exception:
+            self.handleError(record)
 
     def flush(self):
-        data = self.buffer.getvalue().encode("utf-8")
-        self.sp.upload_bytes(self.remote_filename, data)
-        self._line_count = 0
-        self._last_flush = time.time()
-
-    def close(self):
         try:
-            # final flush
-            self.flush()
-        finally:
-            super().close()
+            text = self.buffer.getvalue()
+            if not text:
+                return
+
+            data = text.encode("utf-8")
+
+            # cap size to prevent SharePoint 250MB error
+            if len(data) > self.max_remote_bytes:
+                data = data[-self.max_remote_bytes:]
+
+            self.sp.upload_bytes(self.remote_filename, data)
+
+            # reset buffer after upload
+            self.buffer = io.StringIO()
+            self._bytes_since_upload = 0
+        except Exception:
+            # don't crash billing due to logging
+            pass
+
 class SharePointClient:
     def __init__(self, site_url: str, client_id: str, client_secret: str, folder_url: str, logo_folder_url: str):
         self.site_url = site_url
@@ -248,7 +244,7 @@ def load_views() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     Returns:
         monthly_df: dbo.vw_test_charges_monthly (1 row per invoice)
         breakdown_df: dbo.vw_test_charges_breakdown (charge lines)
-        daily_df: dbo.vw_billing_charges_daily (daily consumption)
+        daily_df: dbo.vw_test_charges_daily (daily consumption)
         basic_df: dbo.vvw_billing_consumption_basic (basic consumption)
     """
     eng = get_engine()
@@ -288,7 +284,7 @@ def build_invoice_headers_from_monthly(monthly: pd.DataFrame) -> pd.DataFrame:
         "transport_firm_amount","transport_overrun_amount",
         "atco_usage_amount","atco_demand_amount","atco_standing_amount",
         "gas_adjustment_charges","distribution_adjustment_charges","regulatory_adjustment_charges",
-        "admin_fee","late_payment_fee","total_amount","gst_amount","total_in_gst_amount"
+        "admin_fee","late_payment_fee","total_amount","gst_amount","total_in_gst_amount", "total_amount_payable","statement_total_amount_payable"
     ]
     for c in money_cols:
         if c in df.columns:
@@ -358,39 +354,47 @@ def build_history_row_from_monthly(m: pd.Series) -> Dict[str, Any]:
     """Build a clean and stable history row from the monthly dataframe row."""
 
     def get(name, default=None):
-        """Return the column value if it exists and is not null."""
         if name in m and pd.notna(m[name]):
             return m[name]
         return default
-    site_name = get("site_name")
+
+    def f(v):
+        # numeric safe float
+        if v in (None, ""):
+            return 0.0
+        try:
+            return float(v)
+        except Exception:
+            return 0.0
+
+    site_name = get("site_name")  # keep as string
+
     bill_start_date = pd.to_datetime(get("bill_start_date"), errors="coerce")
     bill_end_date   = pd.to_datetime(get("bill_end_date"), errors="coerce")
     bill_issue_date = pd.to_datetime(get("bill_issue_date"), errors="coerce")
     read_start_date = pd.to_datetime(get("read_start_date"), errors="coerce")
     read_end_date   = pd.to_datetime(get("read_end_date"), errors="coerce")
+
     total_amount = get("total_amount", default=0)
     gst_amount   = get("gst_amount", default=0)
     total_in_gst_amount = get("total_in_gst_amount")
     if total_in_gst_amount is None:
-        total_in_gst_amount = float(total_amount) + float(gst_amount)
+        total_in_gst_amount = f(total_amount) + f(gst_amount)
+
     statement_total_amount = get("statement_total_amount", default=0)
     statement_gst_amount   = get("statement_gst_amount", default=0)
     statement_total_in_gst_amount = get("statement_total_in_gst_amount")
     if statement_total_in_gst_amount is None:
-        statement_total_in_gst_amount = float(statement_total_amount) + float(statement_gst_amount)
-    
-    invoice_agg_code = get("invoice_agg_code")
-    item_listed = get("item_listed_bills")
-    billing_days = get("billing_days")
+        statement_total_in_gst_amount = f(statement_total_amount) + f(statement_gst_amount)
 
-    def f(v): return float(v) if v not in (None, "") else 0.0
+    statement_total_amount_payable = get("statement_total_amount_payable", default=0)
+    total_amount_payable = get("total_amount_payable", default=0)
 
-    # ---- BUILD FINAL HISTORY RECORD ----
     h = {
         # Base identifiers
-        "invoice_agg_code": invoice_agg_code,
-        "item_listed_bills": item_listed,
-        "billing_days": billing_days,
+        "invoice_agg_code": get("invoice_agg_code"),
+        "item_listed_bills": get("item_listed_bills"),
+        "billing_days": get("billing_days"),
         "statement_number": get("statement_number"),
         "invoice_number": get("invoice_number"),
         "purchase_order_number": get("purchase_order_number"),
@@ -407,7 +411,7 @@ def build_history_row_from_monthly(m: pd.Series) -> Dict[str, Any]:
         "bill_end_date": bill_end_date,
         "bill_issue_date": bill_issue_date,
 
-        # New read dates
+        # Read dates
         "read_start_date": read_start_date,
         "read_end_date": read_end_date,
 
@@ -426,23 +430,28 @@ def build_history_row_from_monthly(m: pd.Series) -> Dict[str, Any]:
         "admin_fee": f(get("admin_fee")),
         "late_payment_fee": f(get("late_payment_fee")),
 
-        # New monthly-level account balances
+        # Balances (Monthly-level)
         "opening_balance": f(get("opening_balance")),
         "payment_received": f(get("payment_received")),
         "balance_carried_forward": f(get("balance_carried_forward")),
 
-        # New statement-level balances
+        # Balances (Statement-level)
         "statement_opening_balance": f(get("statement_opening_balance")),
         "statement_payment_received": f(get("statement_payment_received")),
         "statement_balance_carried_forward": f(get("statement_balance_carried_forward")),
 
-        # Totals
+        # ✅ Totals (FIXED)
         "total_amount": f(total_amount),
         "gst_amount": f(gst_amount),
         "total_in_gst_amount": f(total_in_gst_amount),
         "statement_total_amount": f(statement_total_amount),
         "statement_gst_amount": f(statement_gst_amount),
         "statement_total_in_gst_amount": f(statement_total_in_gst_amount),
+        "total_amount_payable": f(total_amount_payable),
+        "statement_total_amount_payable": f(statement_total_amount_payable),
+
+        # ✅ keep site_name as string
+        "site_name": site_name,
 
         # audit field
         "generated_at_utc": datetime.utcnow(),
@@ -1038,6 +1047,16 @@ def _fetch_statement_variants(engine, base_statement_number: str) -> List[Tuple[
 def _strip_pdf_ext(name: str) -> str:
     return name[:-4] if isinstance(name, str) and name.lower().endswith(".pdf") else name
 
+def _strip_suffix_variant(x: str) -> str:
+    """
+    INV123_2 -> INV123
+    INV123 -> INV123
+    Only strips a trailing _<digits>.
+    """
+    s = _norm_id(x)
+    m = re.fullmatch(r"(.+?)_(\d+)$", s)
+    return m.group(1) if m else s
+
 def _money2(x):
     if x is None:
         return None
@@ -1209,6 +1228,13 @@ def should_process_statement(
         if prev_total is not None and _money2(prev_total) == curr_total:
             logger.info(f"⏭️ Statement {v} already exists with same total; skipping.")
             return False, v
+        curr_total = _money2(statement_total_amount_payable)
+
+        if curr_total is None:
+            logger.warning(f"Statement {statement_number}: new statement_total_amount_payable is NULL/invalid; will process.")
+            curr_hash = content_hash or "TOTAL:None"
+        else:
+            curr_hash = content_hash or f"TOTAL:{curr_total}"
 
     # Use BOTH DB + SP variants ONLY to choose next suffix (relative to ROOT)
     all_variants = sorted(set(db_variants + sp_variants), key=lambda v: (_suffix_num(root, v), v))
@@ -1225,34 +1251,85 @@ def should_process_statement(
     logger.info(f"✅ Will process statement {chosen} (new or changed).")
     return True, chosen
 
-def _apply_history_increment_rule(engine, row: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str, bool]:
-    """
-    One history row per invoice_number unless the *same invoice_number* has a different total:
-      - If any existing variant (base or suffixed) has the SAME total -> SKIP insert and return that variant's invoice_number.
-      - Else create next suffix and INSERT.
-      - If no variants exist -> INSERT base as-is.
+# def _apply_history_increment_rule(engine, row: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str, bool]:
+#     """
+#     One history row per invoice_number unless the *same invoice_number* has a different total:
+#       - If any existing variant (base or suffixed) has the SAME total -> SKIP insert and return that variant's invoice_number.
+#       - Else create next suffix and INSERT.
+#       - If no variants exist -> INSERT base as-is.
 
-    Returns: (row_to_insert_or_None, invoice_number_used, inserted_bool)
+#     Returns: (row_to_insert_or_None, invoice_number_used, inserted_bool)
+#     """
+#     base = row.get("invoice_number")
+#     if not base:
+#         return None, "", False
+
+#     curr_total_in_gst_amount = row.get("total_amount_payable")
+#     curr_norm = _norm2(curr_total_in_gst_amount)
+
+#     variants = _fetch_history_variants(engine, base)
+#     if not variants:
+#         return row, base, True
+
+#     for inv_no, _sfx, tot_norm in variants:
+#         if tot_norm == curr_norm:
+#             return None, inv_no, False
+
+#     next_suffix = max(v[1] for v in variants) + 1
+#     r2 = dict(row)
+#     r2["invoice_number"] = f"{base}_{next_suffix}"
+#     return r2, r2["invoice_number"], True
+
+def _parse_stmt_suffix(root: str, stmt: str) -> int:
+    """root -> 0, root_2 -> 2, root_10 -> 10"""
+    if stmt == root:
+        return 0
+    m = re.fullmatch(re.escape(root) + r"_(\d+)", stmt)
+    return int(m.group(1)) if m else 0
+
+def _apply_suffix(base: str, sfx: int) -> str:
+    return base if sfx in (0, 1) else f"{base}_{sfx}"
+
+def _invoice_exists_same_total(engine, invoice_number: str, total_amount_payable) -> bool:
+    sql = f"""
+        SELECT TOP 1 total_amount_payable
+        FROM {HISTORY_TABLE}
+        WHERE invoice_number = ?
+        ORDER BY generated_at_utc DESC
     """
-    base = row.get("invoice_number")
+    with engine.begin() as con:
+        row = con.exec_driver_sql(sql, (invoice_number,)).fetchone()
+    if not row:
+        return False
+    return _norm2(row[0]) == _norm2(total_amount_payable)
+
+def apply_statement_suffix_to_history_row(
+    engine,
+    hist_row: Dict[str, Any],
+    *,
+    statement_suffix: int,
+) -> Tuple[Optional[Dict[str, Any]], str, bool]:
+    """
+    Enforces: invoice_number suffix must match the statement suffix.
+    - invoice_number becomes base or base_{statement_suffix}
+    - if that invoice_number already exists with SAME total_amount_payable -> SKIP
+    - else INSERT that invoice_number
+    """
+    base = hist_row.get("invoice_number")
     if not base:
         return None, "", False
 
-    curr_total_in_gst_amount = row.get("total_amount_payable")
-    curr_norm = _norm2(curr_total_in_gst_amount)
+    base = _norm_id(base)
+    invoice_number_used = _apply_suffix(base, statement_suffix)
 
-    variants = _fetch_history_variants(engine, base)
-    if not variants:
-        return row, base, True
+    curr_total = hist_row.get("total_amount_payable")
 
-    for inv_no, _sfx, tot_norm in variants:
-        if tot_norm == curr_norm:
-            return None, inv_no, False
+    if _invoice_exists_same_total(engine, invoice_number_used, curr_total):
+        return None, invoice_number_used, False
 
-    next_suffix = max(v[1] for v in variants) + 1
-    r2 = dict(row)
-    r2["invoice_number"] = f"{base}_{next_suffix}"
-    return r2, r2["invoice_number"], True
+    r2 = dict(hist_row)
+    r2["invoice_number"] = invoice_number_used
+    return r2, invoice_number_used, True
 
 def insert_billing_history_batch(engine, rows: List[Dict[str, Any]]) -> List[str]:
     """
@@ -1499,7 +1576,7 @@ def compute_aggregated_mdq(daily_df: pd.DataFrame,
         return None
 
     # Sum all selected MIRNs per day, then take the maximum day total
-    daily_totals = df.groupby("gas_date", as_index=False)["gj_consumption"].sum()
+    daily_totals = df.groupby("gas_date", as_index=False, observed=False)["gj_consumption"].sum()
     return float(daily_totals["gj_consumption"].max()) if not daily_totals.empty else None
 
 def compute_total_consumption(daily_df: pd.DataFrame,
@@ -1529,7 +1606,7 @@ def compute_total_consumption(daily_df: pd.DataFrame,
         return None
 
     # Sum all selected MIRNs per day, then take the maximum day total
-    daily_totals = df.groupby("gas_date", as_index=False)["gj_consumption"].sum()
+    daily_totals = df.groupby("gas_date", as_index=False, observed=False)["gj_consumption"].sum()
     return float(daily_totals["gj_consumption"].sum()) if not daily_totals.empty else None
 
 def write_label_value(pdf,
@@ -1687,7 +1764,9 @@ def unpack_invoice_fields(inv, breakdown):
         "balance_carried_forward": float(inv.get("balance_carried_forward") or 0.0),
         "read_type": inv.get("read_type") or "",
         "total_amount_payable": inv.get("total_amount_payable"),
-        "statement_total_amount_payable": inv.get("statement_total_amount_payable")
+        "statement_total_amount_payable": inv.get("statement_total_amount_payable"),
+        "invoice_number_display": inv.get("invoice_number_display"),
+        "statement_number_display": inv.get("statement_number_display"),
     }
 
     # Build charges_df subset for this invoice
@@ -1880,7 +1959,7 @@ def generate_statement_summary_page(pdf, inv, breakdown, logger, daily, invoice_
         charges_df.assign(
             amt=pd.to_numeric(charges_df["Statement Amount ex GST"], errors="coerce").fillna(0.0)
         )
-        .groupby("Charge Category")["amt"]
+        .groupby("Charge Category", observed=False)["amt"]
         .apply(lambda s: s.drop_duplicates().sum())
     )
 
@@ -2048,10 +2127,14 @@ def generate_invoice_page1(pdf, inv, breakdown, daily, logger):
     write_label_value(pdf, "Account Number", acct, x=10, line_height=6)
     pdf.ln(4)
     write_label_value(pdf, "Purchase Order #", purchase_order, x=10, line_height=6)
+    invoice_number_display = f.get("invoice_number_display") or invoice_number
+    statement_number_display = f.get("statement_number_display") or statement_number
+
     if invoice_agg_code is not None and item_listed_bills == "Yes":
-        write_label_value(pdf, "Tax Invoice No.", statement_number, x=10, line_height=6)
+        write_label_value(pdf, "Tax Invoice No.", statement_number_display, x=10, line_height=6)
     else:
-        write_label_value(pdf, "Tax Invoice No.", invoice_number, x=10, line_height=6)
+        write_label_value(pdf, "Tax Invoice No.", invoice_number_display, x=10, line_height=6)
+
     start_dt = pd.to_datetime(start_date, errors="coerce")
     end_dt   = pd.to_datetime(end_date,   errors="coerce")
     billing_period_lbl = (
@@ -2135,7 +2218,7 @@ def generate_invoice_page1(pdf, inv, breakdown, daily, logger):
 
     # Apply numeric conversion and aggregation
     s_for_pie_cat = (
-        charges_df.groupby("Charge Category")["Amount ex GST"]
+        charges_df.groupby("Charge Category", observed=False)["Amount ex GST"]
                 .apply(lambda s: pd.to_numeric(s, errors="coerce").fillna(0.0).sum())
     )
 
@@ -2177,7 +2260,7 @@ def generate_invoice_page1(pdf, inv, breakdown, daily, logger):
     pdf.set_xy(10, 219)
     pdf.set_font("Arial", "B", 9)
     pdf.cell(80, 6, "Electronic Fund Transfer (EFT)", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(80, 6, f"Reference No. {invoice_number}", fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.cell(80, 6, f"Reference No. {invoice_number_display}", fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_font("Arial", "B", 9); pdf.cell(30, 6, "Account Name", new_x=XPos.RIGHT, new_y=YPos.TOP)
     pdf.set_font("Arial", "", 9); pdf.cell(60, 6, "Agora Retail Pty Limited", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_font("Arial", "B", 9); pdf.cell(30, 6, "BSB", new_x=XPos.RIGHT, new_y=YPos.TOP)
@@ -2192,7 +2275,7 @@ def generate_invoice_page1(pdf, inv, breakdown, daily, logger):
     pdf.set_font("Arial", "B", 9)
     pdf.cell(80, 6, "Alternative Form of Payments*", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_x(110)
-    pdf.cell(80, 6, f"Reference No. {invoice_number}", fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.cell(80, 6, f"Reference No. {invoice_number_display}", fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_xy(110, pdf.get_y())
     pdf.set_font("Arial", "B", 9)
     pdf.cell(50, 4, "Call us at", new_x=XPos.RIGHT, new_y=YPos.TOP)
@@ -2230,7 +2313,8 @@ def generate_invoice_page2(pdf, inv, breakdown, daily, basic, logger):
     charge_notes = f["charge_notes"]
     total_consumption = f["total_consumption"]
     invoice_agg_code = f["invoice_agg_code"]
-    statement_number = f["statement_number"]
+    statement_number = f.get("statement_number_display") or f["statement_number"]
+    invoice_number = f.get("invoice_number_display") or f["invoice_number"]
     spot_gas_amount = f["spot_gas_amount"]
     customer_number = f["customer_number"]
     meter_number = f["meter_number"]
@@ -2247,14 +2331,13 @@ def generate_invoice_page2(pdf, inv, breakdown, daily, basic, logger):
 
     def set_font(weight: str = "", size: float = 8.5) -> None:
         pdf.set_font(font_main, weight, size)
-
+    
     # Account Details (Left Block)
     pdf.set_xy(left_x, 35)
     set_font("", 9.5)
-    if invoice_agg_code is not None and item_listed_bills == "Yes":
-        write_label_value(pdf, "Tax Invoice No.", statement_number, x=10, label_w=label_width_left)
-    else:
-        write_label_value(pdf, "Tax Invoice No.", invoice_number, x=10, label_w=label_width_left)
+    invoice_number_display = f.get("invoice_number_display") or invoice_number
+    write_label_value(pdf, "Tax Invoice No.", invoice_number_display, x=10, label_w=label_width_left)
+
     # write_label_value(pdf, "Tax Invoice No.", invoice_number, x=10, label_w=label_width_left)
     write_label_value(pdf, "Account No.", acct, x=10, label_w=label_width_left)
     write_label_value(pdf, "MIRN", mirn, x=10, label_w=label_width_left)
@@ -2329,7 +2412,7 @@ def generate_invoice_page2(pdf, inv, breakdown, daily, basic, logger):
         draw_table_header()
         row_index = 0
 
-    for category, cat_df in charges_df.groupby("Charge Category", sort=False):
+    for category, cat_df in charges_df.groupby("Charge Category", sort=False, observed=False):
         unit_num = pd.to_numeric(cat_df.get("Amount ex GST"), errors="coerce")
         cat_df = cat_df.loc[unit_num.notna() & (unit_num.abs() > 1e-12)]
         if cat_df.empty:
@@ -2680,39 +2763,70 @@ def generate_invoice_page2(pdf, inv, breakdown, daily, basic, logger):
         multi_mirn_ok = True
 
     # ================= “Please Note” block =================
-    pdf.ln(2)
     NOTE_MIN_H = 25
+    W = 180
 
-    try:
-        page_h = getattr(pdf, "h", 297)
-        b_margin = getattr(pdf, "b_margin", 10)
-        if pdf.get_y() + NOTE_MIN_H > (page_h - b_margin):
-            pdf.add_page()
-    except Exception:
-        pass
+    # --- build the note lines first (so height calc matches what you will print) ---
+    pdf.set_font("Arial", "", 7)
+    lines = []
+    lines.append("* Agora Retail will reconcile Network Charges for this month against the actual charges invoiced by the Network Operator and the adjustment charges will be applied accordingly on the next invoice.")
+    lines.append("* gasTrading Spot Prices are published on the website: https://gastrading.com.au/spot-market/historical-prices-and-volume/bid-and-scheduled")
 
-    box_y = pdf.get_y()
+    if acct in {30001, 30002, 30003, 30007, 30008, 30009, 30010, 30011, 30013, 30015}:
+        lines.append("* The Australian Bureau of Statistics (ABS) has re-referenced the Sep'25 CPI index to 100.00 and aligned it with the new monthly CPI series.")
+        lines.append("* Under the terms of your contract, the Agora Firm Gas Consumption Price is adjusted on a quarterly basis. For Q1 2026 invoices, the applicable firm gas rate is calculated by taking the Dec'25 Firm Gas Consumption Price and escalated by the CPI movement from Sep'25 (index value 100.00) to Dec'25 (index value 100.97), based on the CPI index for the 8 Capital Cities.")
+
+    text3 = f"* {str(charge_notes).strip()}" if (pd.notna(charge_notes) and str(charge_notes).strip()) else ""
+    if text3:
+        lines.append(text3)
+
+    # --- measure total height (dry run) ---
+    page_h = getattr(pdf, "h", 297)
+    b_margin = getattr(pdf, "b_margin", 10)
+    t_margin = getattr(pdf, "t_margin", 10)
+
+    y0 = pdf.get_y() - 1
+
+    # Title height
     pdf.set_font("Arial", "B", 8)
-    pdf.multi_cell(180, 6, "Please Note", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    title_h = pdf.multi_cell(
+        W, 5, "Please Note",
+        dry_run=True, output=MethodReturnValue.HEIGHT
+    )
+
+    # Bullet height(s)
+    pdf.set_font("Arial", "", 7)
+    bullets_h = 0
+    for t in lines:
+        bullets_h += pdf.multi_cell(
+            W, 4, t,
+            dry_run=True, output=MethodReturnValue.HEIGHT
+        )
+
+    block_h = max(NOTE_MIN_H, 5 + title_h + bullets_h)  # 5 ~= your top padding fudge
+
+    # --- if it would overflow, move the cursor UP (no new page) ---
+    bottom_limit = page_h - b_margin
+    overflow = (y0 + block_h) - bottom_limit
+    if overflow > 0:
+        # move up just enough to fit; don't go above top margin
+        new_y = max(t_margin, pdf.get_y() - overflow)
+        pdf.set_y(new_y)
+        y0 = pdf.get_y()
+
+    # --- render for real ---
+    box_y = y0
+
+    pdf.set_font("Arial", "B", 8)
+    pdf.multi_cell(W, 6, "Please Note", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
     pdf.set_font("Arial", "", 7)
-    text1 = "* Agora Retail will reconcile Network Charges for this month against the actual charges invoiced by the Network Operator and the adjustment charges will be applied accordingly on the next invoice."
-    text2 = "* gasTrading Spot Prices are published on the website: https://gastrading.com.au/spot-market/historical-prices-and-volume/bid-and-scheduled"
-    text2026011 = "* The Australian Bureau of Statistics (ABS) has re-referenced the Sep'25 CPI index to 100.00 and aligned it with the new monthly CPI series."
-    text2026012 = "* Under the terms of your contract, the Agora Firm Gas Consumption Price is adjusted on a quarterly basis. For Q1 2026 invoices, the applicable firm gas rate is calculated by taking the Dec'25 Firm Gas Consumption Price and escalated by the CPI movement from Sep'25 (index value 100.00) to Dec'25 (index value 100.97), based on the CPI index for the 8 Capital Cities."
-    text3 = f"* {str(charge_notes).strip()}" if (pd.notna(charge_notes) and str(charge_notes).strip()) else ""
-
-    pdf.multi_cell(180, 4, text1, border=0, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.multi_cell(180, 4, text2, border=0, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    if acct in {30001, 30002, 30003, 30007, 30008, 30009, 30010, 30011, 30013, 30015}:
-        pdf.multi_cell(180, 4, text2026011, border=0, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.multi_cell(180, 4, text2026012, border=0, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.multi_cell(180, 4, text3, border=0)
+    for t in lines:
+        pdf.multi_cell(W, 4, t, border=0, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
     box_bottom = pdf.get_y()
     box_h = max(NOTE_MIN_H, box_bottom - box_y)
-    pdf.rect(10, box_y, 180, box_h)
-
+    pdf.rect(10, box_y, W, box_h)
 # =========================
 # MAIN
 # =========================
@@ -2791,21 +2905,21 @@ def main():
     ensure_billing_history_table(eng)
     stmt_run_cache = StatementRunCache()
     # ---- For each statement ----
-    for original_statement_number, statement_group in headers.groupby("statement_number"):
+    for original_statement_number, statement_group in headers.groupby("statement_number", observed=False):
         # 1) Build a stable list of (invoice_number, invoice_total) for this statement
         inv_totals_df = (
-            statement_group[["invoice_number", "total_in_gst_amount"]]
+            statement_group[["invoice_number", "total_amount_payable"]]
             .dropna(subset=["invoice_number"])
             .assign(
                 invoice_number=lambda d: d["invoice_number"].map(_norm_id),
-                total_in_gst_amount=lambda d: d["total_in_gst_amount"].astype(float).round(2),
+                total_amount_payable=lambda d: d["total_amount_payable"].astype(float).round(2),
             )
-            .groupby("invoice_number", as_index=False)["total_in_gst_amount"]
+            .groupby("invoice_number", as_index=False, observed=False)["total_amount_payable"]
             .sum()
         )
 
-        invoice_pairs = list(zip(inv_totals_df["invoice_number"], inv_totals_df["total_in_gst_amount"]))
-        total_statement_amount = float(inv_totals_df["total_in_gst_amount"].sum().round(2))
+        invoice_pairs = list(zip(inv_totals_df["invoice_number"], inv_totals_df["total_amount_payable"]))
+        statement_total_amount_payable = float(inv_totals_df["total_amount_payable"].sum().round(2))
 
         # IMPORTANT: sort for stability
         invoice_pairs = sorted(invoice_pairs, key=lambda t: t[0])
@@ -2815,7 +2929,7 @@ def main():
         process, final_statement_number = should_process_statement(
             eng,
             original_statement_number,
-            total_statement_amount,
+            statement_total_amount_payable=statement_total_amount_payable,
             content_hash=content_hash,
             run_cache=stmt_run_cache,
             sp_index=sp_index,
@@ -2825,6 +2939,9 @@ def main():
         if not process:
             skipped_duplicates += 1
             continue
+
+        root_stmt = _root_base(original_statement_number)
+        statement_suffix = _parse_stmt_suffix(root_stmt, final_statement_number)
 
         logger.info(f"Processing Statement {final_statement_number} with {len(statement_group)} invoices")
 
@@ -2847,47 +2964,66 @@ def main():
         # ---- For each invoice in this statement ----
         for _, inv in statement_group.iterrows():
             inv = inv.copy()
+
+            # base invoice number used to match breakdown/daily/basic dataframes
+            original_invoice_number = _norm_id(inv["invoice_number"])
+
+            # build history row using base invoice number (lookup key)
+            inv["invoice_number"] = original_invoice_number
             inv["statement_number"] = final_statement_number
-            original_invoice_number = inv["invoice_number"]
 
             hist_row = build_history_row_from_monthly(inv)
-            r2, invoice_number, do_insert = _apply_history_increment_rule(eng, hist_row)
+
+            r2, invoice_number, do_insert = apply_statement_suffix_to_history_row(
+                eng,
+                hist_row,
+                statement_suffix=statement_suffix,
+            )
 
             if not do_insert:
                 skipped_duplicates += 1
                 logger.info(f"Duplicate invoice with same total: {invoice_number}; skipping.")
                 continue
 
+            # ✅ set display fields AFTER invoice_number is determined
+            inv["invoice_number_lookup"] = original_invoice_number
+            inv["invoice_number_display"] = invoice_number
+            inv["statement_number_display"] = final_statement_number
+
+            # keep lookup number for DF matching (very important)
+            inv["invoice_number"] = original_invoice_number
+
+            # ✅ summary page should be generated ONCE per statement
             if not summary_added:
                 first_row = statement_group.iloc[0].copy()
                 first_row["statement_number"] = final_statement_number
+                first_row["statement_number_display"] = final_statement_number
 
-                invoice_numbers = (
-                    statement_group["invoice_number"]
-                    .dropna()
-                    .astype(str)
-                    .tolist()
+                # If you want the list to show suffixed invoice numbers:
+                invoice_numbers = [
+                    _apply_suffix(_norm_id(x), statement_suffix)
+                    for x in statement_group["invoice_number"].dropna().astype(str).tolist()
+                ]
+
+                generate_statement_summary_page(
+                    pdf, first_row, breakdown, logger, daily, invoice_numbers, headers
                 )
-
-            generate_statement_summary_page(pdf, first_row, breakdown, logger, daily, invoice_numbers, headers)
-            summary_added = True
-            
-            inv["invoice_number"] = invoice_number
+                summary_added = True
 
             # Page 1 (conditions)
-            # 
             if original_invoice_number != original_statement_number:
-                if not (inv["item_listed_bills"] == "Yes"):
+                if inv.get("item_listed_bills") != "Yes":
                     generate_invoice_page1(pdf, inv, breakdown, daily, logger)
 
             # Page 2 always
             generate_invoice_page2(pdf, inv, breakdown, daily, basic, logger)
             invoices_emitted += 1
-    
+
             # Insert invoice history
             if r2 is not None and do_insert:
                 insert_billing_history_batch(eng, [r2])
                 logger.info(f"Inserted history for {invoice_number}")
+
             
         # ---- Save statement PDF with **incremented name** ----
         if invoices_emitted == 0:
@@ -2908,6 +3044,11 @@ def main():
         logger.info(f"✅ ✅ ✅ Statement uploaded: {pdf_filename}")
 
     logger.info(f"======= Completed PDF generation; Skipped {skipped_duplicates} duplicate invoices =======")
+    for h in list(logger.handlers):
+        try:
+            h.flush()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
