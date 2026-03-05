@@ -5,6 +5,7 @@ from io import BytesIO, StringIO
 import numpy as np
 import pandas as pd
 import matplotlib
+import gc
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
@@ -1709,6 +1710,7 @@ class PDF(FPDF):
 
 def unpack_invoice_fields(inv, breakdown):
     """Extracts all relevant invoice fields into local variables and returns them as a dict."""
+    inv = inv.fillna("")
     abn = inv.get("abn")
     if abn is not None:
         abn = str(abn)
@@ -1726,10 +1728,11 @@ def unpack_invoice_fields(inv, breakdown):
         "postal_address": inv.get("postal_address"),
         "contact_number": inv.get("contact_number"),
         "distributor_name": inv.get("distributor"),
+        "tariff": inv.get("tariff"),
         "emergency_contact": inv.get("emergency_number"),
         "customer_number": inv.get("customer_number"),
         "statement_account_number": inv.get("statement_account_number"),
-        "purchase_order": inv.get("purchase_order_number"),
+        "purchase_order": inv.get("purchase_order_number") or "",
         "statement_number": inv.get("statement_number"),
         "start_date": inv.get("bill_start_date"),
         "end_date": inv.get("bill_end_date"),
@@ -1867,10 +1870,12 @@ def generate_statement_summary_page(pdf, inv, breakdown, logger, daily, invoice_
     write_label_value(pdf, "Account Number", statement_account_number, x=10)
     pdf.ln(4)
     write_label_value(pdf, "Purchase Order #", purchase_order, x=10, line_height=6)
+
+    statement_number_display = f.get("statement_number_display") or statement_number
     if invoice_agg_code is not None and not item_listed_bills:
-        write_label_value(pdf, "Statement No.", statement_number, x=10, line_height=6)
+        write_label_value(pdf, "Statement No.", statement_number_display, x=10, line_height=6)
     else:
-        write_label_value(pdf, "Tax Invoice No.", statement_number, x=10, line_height=6)
+        write_label_value(pdf, "Tax Invoice No.", statement_number_display, x=10, line_height=6)
 
     start_dt = pd.to_datetime(start_date, errors="coerce")
     end_dt   = pd.to_datetime(end_date,   errors="coerce")
@@ -2319,6 +2324,7 @@ def generate_invoice_page2(pdf, inv, breakdown, daily, basic, logger):
     customer_number = f["customer_number"]
     meter_number = f["meter_number"]
     billing_days = f["billing_days"]
+    tariff = f["tariff"]
 
     pdf.add_page()
 
@@ -2354,7 +2360,16 @@ def generate_invoice_page2(pdf, inv, breakdown, daily, basic, logger):
     else:
         read_period_with_days = f"{read_period} ({billing_days} days)"
     write_label_value(pdf, "Read Period", read_period_with_days, x=105, label_w=label_width_right, value_w=right_value_width)
-    write_label_value(pdf, "Distributor", distributor_name, x=105, label_w=label_width_right, value_w=right_value_width)
+    display_name = f"{distributor_name} ({tariff})" if str(distributor_name).strip().upper() == 'ATCO' else distributor_name
+
+    write_label_value(
+        pdf, 
+        "Distributor", 
+        display_name, 
+        x=105, 
+        label_w=label_width_right, 
+        value_w=right_value_width
+    )
     write_label_value(pdf, "Meter Number", meter_number, x=105, label_w=label_width_right, value_w=right_value_width)
     write_label_value(pdf, 
                       "Distributor MHQ", 
@@ -2830,6 +2845,12 @@ def generate_invoice_page2(pdf, inv, breakdown, daily, basic, logger):
 # =========================
 # MAIN
 # =========================
+import gc
+import matplotlib.pyplot as plt
+
+# =========================
+# MAIN (Memory Optimized)
+# =========================
 def main():
     # ---- Logging setup ----
     log_filename = "Bill_Generating_Log.log"
@@ -2838,10 +2859,11 @@ def main():
     logger = logging.getLogger("SharePointLogger")
     logger.setLevel(logging.INFO)
     logger.handlers.clear()
-    logger.propagate = False  # prevents double-logging if root logger has handlers
+    logger.propagate = False 
 
     skipped_duplicates = 0
 
+    # Environment Variables
     site_url        = os.getenv("SITE_URL")
     client_id       = os.getenv("AZURE_CLIENT_ID")
     client_secret   = os.getenv("AZURE_CLIENT_SECRET")
@@ -2859,6 +2881,7 @@ def main():
     if missing:
         raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
+    # Initialize SharePoint Client ONCE
     sp = SharePointClient(
         site_url=site_url,
         client_id=client_id,
@@ -2867,46 +2890,40 @@ def main():
         logo_folder_url=logo_folder_url
     )
 
-    # ---- Log handler that writes the log file back to SharePoint ----
+    # Handlers
     sp_handler = SharePointLogHandler(sp, log_filename)
     sp_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
     logger.addHandler(sp_handler)
-    # ---- ALSO log to console (Azure Functions / local host output) ----
+    
     console_handler = logging.StreamHandler()
     console_handler.setLevel(logging.INFO)
     console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
     logger.addHandler(console_handler)
 
-    logger.info("=============== Starting PDF generation with charts ===============")
+    logger.info("=============== Starting PDF generation (Cloud-Optimized) ===============")
 
-    # ---- SharePoint folder index (used by should_process_statement) ----
+    # Refresh SharePoint Index
     sp_index = SharePointFolderIndex(sp)
     sp_index.refresh(force=True)
 
-    # ----- Connect to SQL ----
+    # Connect to SQL and load initial DataFrames
     monthly, breakdown, daily, basic = load_views()
-    # if monthly.empty:
-    #     logger.error("No data returned from dbo.vw_test_charges_monthly. Exiting.")
-    #     return
-    # if breakdown.empty:
-    #     logger.error("No data returned from dbo.vw_test_charges_breakdown. Exiting.")
-    #     return
-    # if daily.empty:
-    #     logger.error("No data returned from dbo.vw_test_charges_daily. Exiting.")
-    #     return
-    # if basic.empty:
-    #     logger.error("No data returned from dbo.vw_billing_consumption_basic. Exiting.")
-    #     return
-
     headers = build_invoice_headers_from_monthly(monthly)
 
-    # Engine & table check
+    # Initialize DB Engine and Cache
     eng = get_engine()
     ensure_billing_history_table(eng)
     stmt_run_cache = StatementRunCache()
-    # ---- For each statement ----
+
+    # ---- START STATEMENT LOOP ----
     for original_statement_number, statement_group in headers.groupby("statement_number", observed=False):
-        # 1) Build a stable list of (invoice_number, invoice_total) for this statement
+        
+        # [STEP 1] Memory Pre-Clean
+        plt.close('all')
+        plt.clf()
+        gc.collect()
+
+        # Build stable list for processing check
         inv_totals_df = (
             statement_group[["invoice_number", "total_amount_payable"]]
             .dropna(subset=["invoice_number"])
@@ -2918,136 +2935,116 @@ def main():
             .sum()
         )
 
-        invoice_pairs = list(zip(inv_totals_df["invoice_number"], inv_totals_df["total_amount_payable"]))
+        invoice_pairs = sorted(list(zip(inv_totals_df["invoice_number"], inv_totals_df["total_amount_payable"])), key=lambda t: t[0])
         statement_total_amount_payable = float(inv_totals_df["total_amount_payable"].sum().round(2))
-
-        # IMPORTANT: sort for stability
-        invoice_pairs = sorted(invoice_pairs, key=lambda t: t[0])
-
         content_hash = build_statement_content_hash(invoice_pairs)
 
         process, final_statement_number = should_process_statement(
-            eng,
-            original_statement_number,
+            eng, original_statement_number, 
             statement_total_amount_payable=statement_total_amount_payable,
-            content_hash=content_hash,
-            run_cache=stmt_run_cache,
-            sp_index=sp_index,
-            logger=logger
+            content_hash=content_hash, run_cache=stmt_run_cache,
+            sp_index=sp_index, logger=logger
         )
 
         if not process:
             skipped_duplicates += 1
             continue
 
-        root_stmt = _root_base(original_statement_number)
-        statement_suffix = _parse_stmt_suffix(root_stmt, final_statement_number)
+        logger.info(f"Processing Statement {final_statement_number}...")
 
-        logger.info(f"Processing Statement {final_statement_number} with {len(statement_group)} invoices")
-
+        # [STEP 2] Create PDF Object
         pdf = PDF()
         pdf.alias_nb_pages()
         invoices_emitted = 0
         summary_added = False
+        statement_suffix = _parse_stmt_suffix(_root_base(original_statement_number), final_statement_number)
 
-        # IMPORTANT: inject final_statement_number into the statement row BEFORE PDF generation
-        # first_row = statement_group.iloc[0].copy()
-        # first_row["statement_number"] = final_statement_number
-        # invoice_numbers = (
-        #     statement_group["invoice_number"]
-        #     .dropna()
-        #     .astype(str)
-        #     .tolist()
-        # )
-        # generate_statement_summary_page(pdf, first_row, breakdown, logger, daily, invoice_numbers, headers)
+        try:
+            # ---- For each invoice in this statement ----
+            for _, inv in statement_group.iterrows():
+                inv = inv.copy()
+                original_invoice_number = _norm_id(inv["invoice_number"])
+                
+                inv["invoice_number"] = original_invoice_number
+                inv["statement_number"] = final_statement_number
 
-        # ---- For each invoice in this statement ----
-        for _, inv in statement_group.iterrows():
-            inv = inv.copy()
-
-            # base invoice number used to match breakdown/daily/basic dataframes
-            original_invoice_number = _norm_id(inv["invoice_number"])
-
-            # build history row using base invoice number (lookup key)
-            inv["invoice_number"] = original_invoice_number
-            inv["statement_number"] = final_statement_number
-
-            hist_row = build_history_row_from_monthly(inv)
-
-            r2, invoice_number, do_insert = apply_statement_suffix_to_history_row(
-                eng,
-                hist_row,
-                statement_suffix=statement_suffix,
-            )
-
-            if not do_insert:
-                skipped_duplicates += 1
-                logger.info(f"Duplicate invoice with same total: {invoice_number}; skipping.")
-                continue
-
-            # ✅ set display fields AFTER invoice_number is determined
-            inv["invoice_number_lookup"] = original_invoice_number
-            inv["invoice_number_display"] = invoice_number
-            inv["statement_number_display"] = final_statement_number
-
-            # keep lookup number for DF matching (very important)
-            inv["invoice_number"] = original_invoice_number
-
-            # ✅ summary page should be generated ONCE per statement
-            if not summary_added:
-                first_row = statement_group.iloc[0].copy()
-                first_row["statement_number"] = final_statement_number
-                first_row["statement_number_display"] = final_statement_number
-
-                # If you want the list to show suffixed invoice numbers:
-                invoice_numbers = [
-                    _apply_suffix(_norm_id(x), statement_suffix)
-                    for x in statement_group["invoice_number"].dropna().astype(str).tolist()
-                ]
-
-                generate_statement_summary_page(
-                    pdf, first_row, breakdown, logger, daily, invoice_numbers, headers
+                hist_row = build_history_row_from_monthly(inv)
+                r2, invoice_number, do_insert = apply_statement_suffix_to_history_row(
+                    eng, hist_row, statement_suffix=statement_suffix
                 )
-                summary_added = True
 
-            # Page 1 (conditions)
-            if original_invoice_number != original_statement_number:
-                if inv.get("item_listed_bills") != "Yes":
-                    generate_invoice_page1(pdf, inv, breakdown, daily, logger)
+                if not do_insert:
+                    skipped_duplicates += 1
+                    continue
 
-            # Page 2 always
-            generate_invoice_page2(pdf, inv, breakdown, daily, basic, logger)
-            invoices_emitted += 1
+                inv["invoice_number_lookup"] = original_invoice_number
+                inv["invoice_number_display"] = invoice_number
+                inv["statement_number_display"] = final_statement_number
+                inv["invoice_number"] = original_invoice_number
 
-            # Insert invoice history
-            if r2 is not None and do_insert:
-                insert_billing_history_batch(eng, [r2])
-                logger.info(f"Inserted history for {invoice_number}")
+                # Generate Summary Page (Once)
+                if not summary_added:
+                    first_row = statement_group.iloc[0].copy()
+                    first_row["statement_number_display"] = final_statement_number
+                    
+                    display_invoice_list = [
+                        _apply_suffix(_norm_id(x), statement_suffix)
+                        for x in statement_group["invoice_number"].dropna().astype(str).tolist()
+                    ]
 
+                    generate_statement_summary_page(
+                        pdf, first_row, breakdown, logger, daily, display_invoice_list, headers
+                    )
+                    summary_added = True
+
+                # Generate Invoice Pages
+                if original_invoice_number != original_statement_number:
+                    if inv.get("item_listed_bills") != "Yes":
+                        generate_invoice_page1(pdf, inv, breakdown, daily, logger)
+
+                generate_invoice_page2(pdf, inv, breakdown, daily, basic, logger)
+                invoices_emitted += 1
+
+                # DB Insert
+                if r2 is not None:
+                    insert_billing_history_batch(eng, [r2])
             
-        # ---- Save statement PDF with **incremented name** ----
-        if invoices_emitted == 0:
-            logger.info(f"⏭️ Statement {final_statement_number} produced 0 new invoices; skipping PDF upload.")
-            continue
+            # [STEP 3] Upload and Final Cleanup
+            if invoices_emitted > 0:
+                generated_ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+                pdf_filename = f"{final_statement_number}_Generated_{generated_ts}.pdf"
 
-        generated_ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
-        pdf_filename = f"{final_statement_number}_Generated_{generated_ts}.pdf"
+                # Convert to bytes
+                pdf_content = pdf.output(dest="S")
+                if isinstance(pdf_content, str):
+                    pdf_content = pdf_content.encode("latin1")
 
-        pdf_content = pdf.output(dest="S")  # returns a str in fpdf2
-        if isinstance(pdf_content, str):
-            pdf_content = pdf_content.encode("latin1")
+                # Upload to SharePoint
+                upload_bytes_to_sharepoint(pdf_content, pdf_filename)
+                logger.info(f"✅ Statement uploaded: {pdf_filename}")
 
-        upload_bytes_to_sharepoint(pdf_content, pdf_filename)
+                # EXPLICIT MEMORY RELEASE
+                del pdf_content
+            
+        except Exception as e:
+            logger.error(f"❌ Error during statement {final_statement_number}: {str(e)}")
+        
+        finally:
+            # [STEP 4] The "Cloud Anchor" Cleanup
+            # This runs even if the loop fails, preventing memory carry-over
+            if 'pdf' in locals():
+                del pdf
+            plt.close('all')
+            plt.clf()
+            gc.collect()
 
-        logger.info(f"Statement uploaded: {pdf_filename}")
-
-        logger.info(f"✅ ✅ ✅ Statement uploaded: {pdf_filename}")
-
-    logger.info(f"======= Completed PDF generation; Skipped {skipped_duplicates} duplicate invoices =======")
+    logger.info(f"======= Completed; Skipped {skipped_duplicates} duplicates =======")
+    
+    # Flush logs to SharePoint
     for h in list(logger.handlers):
         try:
             h.flush()
-        except Exception:
+        except:
             pass
 
 if __name__ == "__main__":
