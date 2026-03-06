@@ -368,8 +368,6 @@ def build_history_row_from_monthly(m: pd.Series) -> Dict[str, Any]:
         except Exception:
             return 0.0
 
-    site_name = get("site_name")  # keep as string
-
     bill_start_date = pd.to_datetime(get("bill_start_date"), errors="coerce")
     bill_end_date   = pd.to_datetime(get("bill_end_date"), errors="coerce")
     bill_issue_date = pd.to_datetime(get("bill_issue_date"), errors="coerce")
@@ -412,7 +410,7 @@ def build_history_row_from_monthly(m: pd.Series) -> Dict[str, Any]:
         "bill_start_date": bill_start_date,
         "bill_end_date": bill_end_date,
         "bill_issue_date": bill_issue_date,
-        "payment_term": payment_term,
+        "payment_term": get("payment_term"),
 
         # Read dates
         "read_start_date": read_start_date,
