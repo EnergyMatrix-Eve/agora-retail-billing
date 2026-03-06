@@ -1348,66 +1348,69 @@ def insert_billing_history_batch(engine, rows: List[Dict[str, Any]]) -> List[str
 
     # FULL COLUMN LIST – MUST MATCH SQL TABLE EXACTLY
     cols = [
-        "invoice_agg_code",
-        "item_listed_bills",
-        "statement_number",
-        "invoice_number",
-        "purchase_order_number",
-        "company_name",
-        "company_code",
-        "account_number",
-        "mirn",
-        "distributor",
-        "site_name",
+            "invoice_agg_code",
+            "item_listed_bills",
+            "statement_number",
+            "invoice_number",
+            "purchase_order_number",
+            "company_name",
+            "company_code",
+            "account_number",
+            "mirn",
+            "distributor",
+            "site_name",
 
-        # Dates
-        "bill_start_date",
-        "bill_end_date",
-        "bill_issue_date",
-        "payment_term",
-        "read_start_date",
-        "read_end_date",
+            # Dates
+            "bill_start_date",
+            "bill_end_date",
+            "bill_issue_date",
+            # "payment_term",  <-- REMOVE THIS ONE (Duplicate & causing type clash)
+            "read_start_date",
+            "read_end_date",
 
-        "billing_days",
-        "gj_consumption",
+            "billing_days",
+            "gj_consumption",
 
-        # Monthly-level balances
-        "opening_balance",
-        "payment_received",
-        "balance_carried_forward",
+            # Monthly-level balances
+            "opening_balance",
+            "payment_received",
+            "balance_carried_forward",
 
-        # Statement-level balances
-        "statement_opening_balance",
-        "statement_payment_received",
-        "statement_balance_carried_forward",
+            # Statement-level balances
+            "statement_opening_balance",
+            "statement_payment_received",
+            "statement_balance_carried_forward",
 
-        # Charges
-        "firm_gas_amount",
-        "spot_gas_amount",
-        "atco_usage_amount",
-        "atco_demand_amount",
-        "atco_standing_amount",
-        "transport_firm_amount",
-        "transport_overrun_amount",
-        "gas_adjustment_charges",
-        "distribution_adjustment_charges",
-        "regulatory_adjustment_charges",
-        "admin_fee",
-        "late_payment_fee",
+            # Charges
+            "firm_gas_amount",
+            "spot_gas_amount",
+            "atco_usage_amount",
+            "atco_demand_amount",
+            "atco_standing_amount",
+            "transport_firm_amount",
+            "transport_overrun_amount",
+            "gas_adjustment_charges",
+            "distribution_adjustment_charges",
+            "regulatory_adjustment_charges",
+            "admin_fee",
+            "late_payment_fee",
 
-        # Totals
-        "total_amount",
-        "gst_amount",
-        "total_in_gst_amount",
-        "statement_total_amount",
-        "statement_gst_amount",
-        "statement_total_in_gst_amount",
-        "total_amount_payable",
-        "statement_total_amount_payable",
-
-        # System field
-        "generated_at_utc",
-    ]
+            # Totals
+            "total_amount",
+            "gst_amount",
+            "total_in_gst_amount",
+            "statement_total_amount",
+            "statement_gst_amount",
+            "statement_total_in_gst_amount",
+            "total_amount_payable",
+            "statement_total_amount_payable",
+            
+            # System field
+            "generated_at_utc",
+            
+            # Keep this one to match your table's last column
+            "payment_term", 
+        ]
 
     placeholders = ",".join(["?"] * len(cols))
 
