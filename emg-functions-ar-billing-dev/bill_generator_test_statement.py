@@ -406,11 +406,13 @@ def build_history_row_from_monthly(m: pd.Series) -> Dict[str, Any]:
         "account_number": get("account_number"),
         "mirn": get("mirn"),
         "distributor": get("distributor"),
+        "site_name": get("site_name"),
 
         # Billing period
         "bill_start_date": bill_start_date,
         "bill_end_date": bill_end_date,
         "bill_issue_date": bill_issue_date,
+        "payment_term": payment_term,
 
         # Read dates
         "read_start_date": read_start_date,
@@ -451,9 +453,6 @@ def build_history_row_from_monthly(m: pd.Series) -> Dict[str, Any]:
         "total_amount_payable": f(total_amount_payable),
         "statement_total_amount_payable": f(statement_total_amount_payable),
 
-        # ✅ keep site_name as string
-        "site_name": site_name,
-
         # audit field
         "generated_at_utc": datetime.utcnow(),
     }
@@ -476,12 +475,14 @@ def sanitize_history_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "account_number":                  _to_str_or_none(r.get("account_number")),
             "mirn":                            _to_str_or_none(r.get("mirn")),
             "distributor":                     _to_str_or_none(r.get("distributor")),
+            "site_name":                     _to_str_or_none(r.get("site_name")),
             "billing_days":                    _to_int_or_none(r.get("billing_days")),
 
             # Dates
             "bill_start_date":                 _to_date_or_none(r.get("bill_start_date")),
             "bill_end_date":                   _to_date_or_none(r.get("bill_end_date")),
             "bill_issue_date":                 _to_date_or_none(r.get("bill_issue_date")),
+            "payment_term":                     r.get("bill_issue_date"),
             "read_start_date":                 _to_date_or_none(r.get("read_start_date")),
             "read_end_date":                   _to_date_or_none(r.get("read_end_date")),
 
@@ -1359,11 +1360,13 @@ def insert_billing_history_batch(engine, rows: List[Dict[str, Any]]) -> List[str
         "account_number",
         "mirn",
         "distributor",
+        "site_name",
 
         # Dates
         "bill_start_date",
         "bill_end_date",
         "bill_issue_date",
+        "payment_term",
         "read_start_date",
         "read_end_date",
 
@@ -1770,6 +1773,7 @@ def unpack_invoice_fields(inv, breakdown):
         "statement_total_amount_payable": inv.get("statement_total_amount_payable"),
         "invoice_number_display": inv.get("invoice_number_display"),
         "statement_number_display": inv.get("statement_number_display"),
+        "site_name": inv.get("site_name"),
     }
 
     # Build charges_df subset for this invoice
