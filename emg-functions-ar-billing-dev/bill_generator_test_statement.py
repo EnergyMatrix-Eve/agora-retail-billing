@@ -411,6 +411,8 @@ def build_history_row_from_monthly(m: pd.Series) -> Dict[str, Any]:
         "bill_end_date": bill_end_date,
         "bill_issue_date": bill_issue_date,
         "payment_term": get("payment_term"),
+        "file_url": "",
+        "billing_email": get("billing_email"),
 
         # Read dates
         "read_start_date": read_start_date,
@@ -473,7 +475,9 @@ def sanitize_history_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "account_number":                  _to_str_or_none(r.get("account_number")),
             "mirn":                            _to_str_or_none(r.get("mirn")),
             "distributor":                     _to_str_or_none(r.get("distributor")),
-            "site_name":                     _to_str_or_none(r.get("site_name")),
+            "site_name":                       _to_str_or_none(r.get("site_name")),
+            "file_url":                        "",
+            "billing_email":                   _to_str_or_none("billing_email"),
             "billing_days":                    _to_int_or_none(r.get("billing_days")),
 
             # Dates
@@ -1393,7 +1397,9 @@ def insert_billing_history_batch(engine, rows: List[Dict[str, Any]]) -> List[str
         "statement_balance_carried_forward",
         "statement_total_amount_payable",
         "generated_at_utc",
-        "payment_term"  
+        "payment_term",
+        "file_url",
+        "billing_email",
     ]
 
     placeholders = ",".join(["?"] * len(cols))
@@ -3000,7 +3006,7 @@ def main():
             
             # [STEP 3] Upload and Final Cleanup
             if invoices_emitted > 0:
-                generated_ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+                generated_ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
                 pdf_filename = f"{final_statement_number}_Generated_{generated_ts}.pdf"
 
                 # Convert to bytes
