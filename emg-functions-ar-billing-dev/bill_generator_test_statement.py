@@ -285,7 +285,7 @@ def build_invoice_headers_from_monthly(monthly: pd.DataFrame) -> pd.DataFrame:
         "transport_firm_amount","transport_overrun_amount",
         "atco_usage_amount","atco_demand_amount","atco_standing_amount",
         "gas_adjustment_charges","distribution_adjustment_charges","regulatory_adjustment_charges",
-        "admin_fee","late_payment_fee","total_amount","gst_amount","total_in_gst_amount", "total_amount_payable","statement_total_amount_payable"
+        "admin_fee","welcome_credit","late_payment_fee","total_amount","gst_amount","total_in_gst_amount", "total_amount_payable","statement_total_amount_payable"
     ]
     for c in money_cols:
         if c in df.columns:
@@ -411,8 +411,6 @@ def build_history_row_from_monthly(m: pd.Series) -> Dict[str, Any]:
         "bill_end_date": bill_end_date,
         "bill_issue_date": bill_issue_date,
         "payment_term": get("payment_term"),
-        "file_url": "",
-        "billing_email": get("billing_email"),
 
         # Read dates
         "read_start_date": read_start_date,
@@ -431,6 +429,7 @@ def build_history_row_from_monthly(m: pd.Series) -> Dict[str, Any]:
         "distribution_adjustment_charges": f(get("distribution_adjustment_charges")),
         "regulatory_adjustment_charges": f(get("regulatory_adjustment_charges")),
         "admin_fee": f(get("admin_fee")),
+        "welcome_credit": f(get("welcome_credit")),
         "late_payment_fee": f(get("late_payment_fee")),
 
         # Balances (Monthly-level)
@@ -476,8 +475,7 @@ def sanitize_history_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "mirn":                            _to_str_or_none(r.get("mirn")),
             "distributor":                     _to_str_or_none(r.get("distributor")),
             "site_name":                       _to_str_or_none(r.get("site_name")),
-            "file_url":                        "",
-            "billing_email":                   _to_str_or_none("billing_email"),
+            "billing_email":                   _to_str_or_none(r.get("billing_email")),
             "billing_days":                    _to_int_or_none(r.get("billing_days")),
 
             # Dates
@@ -511,6 +509,7 @@ def sanitize_history_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "distribution_adjustment_charges": _to_float_or_none(r.get("distribution_adjustment_charges")),
             "regulatory_adjustment_charges":   _to_float_or_none(r.get("regulatory_adjustment_charges")),
             "admin_fee":                       _to_float_or_none(r.get("admin_fee")),
+            "welcome_credit":                  _to_float_or_none(r.get("welcome_credit")),
             "late_payment_fee":                _to_float_or_none(r.get("late_payment_fee")),
 
             # Totals
@@ -1398,8 +1397,7 @@ def insert_billing_history_batch(engine, rows: List[Dict[str, Any]]) -> List[str
         "statement_total_amount_payable",
         "generated_at_utc",
         "payment_term",
-        "file_url",
-        "billing_email",
+        "welcome_credit",
     ]
 
     placeholders = ",".join(["?"] * len(cols))

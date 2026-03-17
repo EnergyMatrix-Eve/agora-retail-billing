@@ -2,12 +2,12 @@ import azure.functions as func
 import logging
 import os
 from datetime import datetime
-import bill_generator_test_statement#
+import bill_generator
 
 def run_billing(env_name: str):
-    logging.warning(f"🚀 Running bill_generator_test_statement.main() for {env_name}")
-    bill_generator_test_statement.main()#
-    logging.warning(f"✅ bill_generator_test_statement.main() completed for {env_name}")
+    logging.warning(f"🚀 Running bill_generator.main() for {env_name}")
+    bill_generator.main()#
+    logging.warning(f"✅ bill_generator.main() completed for {env_name}")
 
 
 app = func.FunctionApp()

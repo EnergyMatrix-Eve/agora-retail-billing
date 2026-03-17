@@ -1,8 +1,12 @@
 import os
 import logging
+import io
 from io import BytesIO, StringIO
 import numpy as np
 import pandas as pd
+import matplotlib
+import gc
+matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from fpdf import FPDF
@@ -13,13 +17,19 @@ import re
 import csv
 from decimal import Decimal, ROUND_HALF_UP
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Iterable
 import matplotlib as mpl
 from matplotlib.font_manager import FontProperties
-from fpdf.enums import XPos, YPos
+from fpdf.enums import XPos, YPos, MethodReturnValue
 from sqlalchemy import create_engine
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 import msal
+from decimal import Decimal, InvalidOperation
+import time
+import random
+import hashlib
+from dataclasses import dataclass, field
+import math
 #from dotenv import load_dotenv
 
 # =========================
@@ -44,7 +54,6 @@ GENERATE_DATE = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
 # If monthly view totals are EX-GST
 GST_RATE = 0.00
 
-
 # =========================
 # SharePoint connection
 # =========================
@@ -61,68 +70,6 @@ def get_sharepoint_context() -> ClientContext:
     ctx = ClientContext(site_url).with_credentials(creds)
     return ctx
 
-def upload_bytes_to_sharepoint(file_bytes: bytes, remote_filename: str) -> None:
-    ctx = get_sharepoint_context()
-    folder = ctx.web.get_folder_by_server_relative_url(FOLDER)
-    try:
-        folder.upload_file(remote_filename, file_bytes).execute_query()
-        print(f"✅ Uploaded {remote_filename} to SharePoint")
-    except ClientRequestException as ex:
-        print(f"SharePoint error: {ex}")
-    except Exception as e:
-        print(f"Unexpected error uploading {remote_filename}: {e}")
-
-# =========================
-# SharePoint log
-# =========================
-class SharePointLogHandler(logging.Handler):
-    """Custom logging handler that appends logs to a persistent file on SharePoint."""
-    def __init__(self, remote_filename: str):
-        super().__init__()
-        self.remote_filename = remote_filename
-        self.buffer = StringIO()
-
-        # Try to download existing log
-        existing = download_file_from_sharepoint(self.remote_filename)
-        if existing:
-            try:
-                self.buffer.write(existing.decode("utf-8"))
-            except Exception:
-                # If file not UTF-8, start fresh
-                pass
-
-    def emit(self, record):
-        try:
-            msg = self.format(record)
-            self.buffer.write(msg + "\n")
-            # Upload the entire buffer back to SharePoint
-            upload_bytes_to_sharepoint(
-                self.buffer.getvalue().encode("utf-8"),
-                self.remote_filename
-            )
-        except Exception as e:
-            print(f"Logging error: {e}")
-
-# =========================
-# SharePoint helper
-# =========================
-
-def list_files_in_sharepoint_folder(folder: str) -> List[str]:
-    """
-    Returns list of filenames in the target SharePoint folder.
-    """
-    try:
-        ctx = get_sharepoint_context()
-        target_folder = ctx.web.get_folder_by_server_relative_url(folder)
-        files = target_folder.files.get().execute_query()
-        return [f.name for f in files]
-    except ClientRequestException as e:
-        logging.error(f"Failed to list SharePoint folder {folder}: {e}")
-        return []
-    except Exception as e:
-        logging.error(f"Unexpected error listing SharePoint folder {folder}: {e}")
-        return []
-
 def upload_bytes_to_sharepoint(file_bytes: bytes, filename: str) -> None:
     try:
         ctx = get_sharepoint_context()
@@ -136,12 +83,147 @@ def upload_bytes_to_sharepoint(file_bytes: bytes, filename: str) -> None:
         logging.error(f"Unexpected error uploading {filename}: {e}")
         raise
 
+def _status_code_from_sp_exception(e: Exception) -> int | None:
+    resp = getattr(e, "response", None)
+    if resp is not None:
+        return getattr(resp, "status_code", None) or getattr(resp, "status", None)
+    # office365 sometimes doesn't attach response; fall back to string match
+    msg = str(e)
+    if "404" in msg and ("Not Found" in msg or "does not exist" in msg):
+        return 404
+    return None
+
+TRANSIENT_STATUS = {429, 500, 502, 503, 504}
+
+class SharePointLogHandler(logging.Handler):
+    def __init__(
+        self,
+        sp,
+        remote_filename: str,
+        upload_every_bytes: int = 512 * 1024,     # 512KB
+        max_remote_bytes: int = 10 * 1024 * 1024  # 10MB kept remotely
+    ):
+        super().__init__()
+        self.sp = sp
+        self.remote_filename = remote_filename
+
+        self.upload_every_bytes = upload_every_bytes
+        self.max_remote_bytes = max_remote_bytes
+
+        self.buffer = io.StringIO()
+        self._bytes_since_upload = 0
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            line = msg + "\n"
+            self.buffer.write(line)
+            self._bytes_since_upload += len(line.encode("utf-8"))
+
+            # flush only when big enough
+            if self._bytes_since_upload >= self.upload_every_bytes:
+                self.flush()
+        except Exception:
+            self.handleError(record)
+
+    def flush(self):
+        try:
+            text = self.buffer.getvalue()
+            if not text:
+                return
+
+            data = text.encode("utf-8")
+
+            # cap size to prevent SharePoint 250MB error
+            if len(data) > self.max_remote_bytes:
+                data = data[-self.max_remote_bytes:]
+
+            self.sp.upload_bytes(self.remote_filename, data)
+
+            # reset buffer after upload
+            self.buffer = io.StringIO()
+            self._bytes_since_upload = 0
+        except Exception:
+            # don't crash billing due to logging
+            pass
+
+class SharePointClient:
+    def __init__(self, site_url: str, client_id: str, client_secret: str, folder_url: str, logo_folder_url: str):
+        self.site_url = site_url
+        self.folder_url = folder_url
+        self.logo_folder_url = logo_folder_url
+        creds = ClientCredential(client_id, client_secret)
+        self.ctx = ClientContext(site_url).with_credentials(creds)
+
+    def _retry(self, fn, *, tries=6, base_sleep=1.0):
+        for i in range(tries):
+            try:
+                return fn()
+            except ClientRequestException as e:
+                status = getattr(e, "response", None).status_code if getattr(e, "response", None) else None
+                if status not in TRANSIENT_STATUS or i == tries - 1:
+                    raise
+            except Exception:
+                if i == tries - 1:
+                    raise
+            # backoff + jitter
+            sleep = base_sleep * (2 ** i) + random.uniform(0, 0.25)
+            time.sleep(sleep)
+
+    def folder(self):
+        return self.ctx.web.get_folder_by_server_relative_url(self.folder_url)
+
+    def upload_bytes(self, filename: str, data: bytes):
+        def op():
+            self.folder().upload_file(filename, data).execute_query()
+        return self._retry(op)
+
+    def download_bytes(self, filename: str) -> bytes | None:
+        def op():
+            path = f"{self.folder_url.rstrip('/')}/{filename.lstrip('/')}"
+            f = self.ctx.web.get_file_by_server_relative_url(path)
+            buf = BytesIO()
+            f.download(buf).execute_query()
+            buf.seek(0)
+            return buf.read()
+
+        try:
+            return self._retry(op)
+        except ClientRequestException as e:
+            status = _status_code_from_sp_exception(e)
+            if status == 404:
+                return None
+            raise
+
+    def list_file_names(self) -> list[str]:
+        def op():
+            folder = self.folder()
+            files = folder.files
+            self.ctx.load(files)
+            self.ctx.execute_query()
+            return [f.name for f in files]
+        return self._retry(op)
+
+    def download_logo_bytes(self, logo_filename: str) -> bytes | None:
+        def op():
+            f = self.ctx.web.get_file_by_server_relative_url(f"{self.logo_folder_url.rstrip('/')}/{logo_filename}")
+            buf = BytesIO()
+            f.download(buf).execute_query()
+            buf.seek(0)
+            return buf.read()
+        try:
+            return self._retry(op)
+        except Exception:
+            return None
+
+
+
 # =========================
 # Style / Colors
 # =========================
 custom_colors = {
     "Firm Gas Sales": "#0089D0",
-    "Spot Gas Sales": "#9DC0D7",
+    "Overrun Charges": "#9DC0D7",
     "Transport Fee": "#425B7E",
     "Distribution Charges": "#F4A261",
     "Adjustment Charges": "#E76F51",
@@ -149,27 +231,14 @@ custom_colors = {
 }
 mpl.rcParams["font.family"] = "Arial"
 
-
 # =========================
 # SQL helpers
 # =========================
 def get_engine():
     return create_engine(
-        f"mssql+pyodbc://{username}:{password}@{server}/{database}?driver=ODBC+Driver+18+for+SQL+Server",
+        f"mssql+pyodbc://{username}:{password}@{server}/{database}?driver=ODBC+Driver+18+for+SQL+Server",  
         fast_executemany=True
     )
-
-def ensure_billing_history_table(engine) -> None:
-    q = """
-    SELECT 1
-    FROM sys.objects
-    WHERE object_id = OBJECT_ID(N'dbo.billing_history')
-      AND type = N'U'
-    """
-    with engine.begin() as con:
-        row = con.exec_driver_sql(q).fetchone()
-        if row is None:
-            raise RuntimeError("Table dbo.billing_history does not exist. Please create it first.")
 
 def load_views() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
@@ -177,6 +246,7 @@ def load_views() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         monthly_df: dbo.vw_billing_charges_monthly (1 row per invoice)
         breakdown_df: dbo.vw_billing_charges_breakdown (charge lines)
         daily_df: dbo.vw_billing_charges_daily (daily consumption)
+        basic_df: dbo.vvw_billing_consumption_basic (basic consumption)
     """
     eng = get_engine()
     with eng.begin() as conn:
@@ -186,11 +256,16 @@ def load_views() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         try:
             daily_df = pd.read_sql("SELECT * FROM dbo.vw_billing_charges_daily;", conn)
         except Exception:
-            logging.warning("vw_billing_charges_daily not found; consumption chart will be skipped.")
+            logging.warning("🚫 vw_billing_charges_daily not found; consumption chart will be skipped.")
             daily_df = pd.DataFrame()
+        try:
+            basic_df = pd.read_sql("SELECT * FROM dbo.vw_billing_consumption_basic;", conn)
+        except Exception:
+            logging.warning("🚫 vw_billing_consumption_basic not found; consumption chart will be skipped.")
+            basic_df = pd.DataFrame()
 
-    logging.info(f"monthly rows={len(monthly_df)}, breakdown rows={len(breakdown_df)}, daily rows={len(daily_df)}")
-    return monthly_df, breakdown_df, daily_df
+    logging.info(f"monthly rows={len(monthly_df)}, breakdown rows={len(breakdown_df)}, daily rows={len(daily_df)}, basic rows={len(basic_df)}")
+    return monthly_df, breakdown_df, daily_df, basic_df
 
 
 # =========================
@@ -210,7 +285,7 @@ def build_invoice_headers_from_monthly(monthly: pd.DataFrame) -> pd.DataFrame:
         "transport_firm_amount","transport_overrun_amount",
         "atco_usage_amount","atco_demand_amount","atco_standing_amount",
         "gas_adjustment_charges","distribution_adjustment_charges","regulatory_adjustment_charges",
-        "admin_fee","late_payment_fee","total_amount","gst_amount","total_in_gst_amount"
+        "admin_fee","welcome_credit","late_payment_fee","total_amount","gst_amount","total_in_gst_amount", "total_amount_payable","statement_total_amount_payable"
     ]
     for c in money_cols:
         if c in df.columns:
@@ -222,101 +297,241 @@ def build_invoice_headers_from_monthly(monthly: pd.DataFrame) -> pd.DataFrame:
 def build_charges_df_from_breakdown(invoice_lines: pd.DataFrame) -> pd.DataFrame:
     """
     Convert raw breakdown rows to the table schema expected by the PDF section.
+    Safely maps columns and includes invoice_number for downstream lookup.
     """
     if invoice_lines.empty:
         return pd.DataFrame(columns=[
-            "Charge Category","Charge Type","Rate","Rate UOM","Unit","Unit UOM","Amount ex GST"
+            "invoice_number",
+            "Charge Category","Charge Type","Rate","Rate UOM",
+            "Unit","Unit UOM","Amount ex GST","Statement Amount ex GST"
         ])
+
     df = invoice_lines.copy()
+
+    # Safely extract fields if present
+    def col(c, default=""):
+        return df[c] if c in df.columns else pd.Series([default] * len(df))
+
     out = pd.DataFrame({
-        "Charge Category": df["charge_category"] if "charge_category" in df.columns else pd.Series(["Other"] * len(df)),
-        "Charge Type": df["charge_type"] if "charge_type" in df.columns else pd.Series([""] * len(df)),
-        "Rate": df["rate"] if "rate" in df.columns else pd.Series([""] * len(df)),
-        "Rate UOM": df["rate_uom"] if "rate_uom" in df.columns else pd.Series([""] * len(df)),
-        "Unit": df["unit"] if "unit" in df.columns else pd.Series([""] * len(df)),
-        "Unit UOM": df["unit_uom"] if "unit_uom" in df.columns else pd.Series([""] * len(df)),
-        "Amount ex GST": df["amount"] if "amount" in df.columns else pd.Series([""] * len(df)),
+        "invoice_number": col("invoice_number", default=None),
+
+        "Charge Category": col("charge_category", default="Other"),
+        "Charge Type": col("charge_type"),
+        "Rate": col("rate"),
+        "Rate UOM": col("rate_uom"),
+        "Unit": col("unit"),
+        "Unit UOM": col("unit_uom"),
+
+        # Amounts
+        "Amount ex GST": col("category_amount"),
+        "Statement Amount ex GST": col("category_statement_total_amount"),
     })
-    order = ["Firm Gas Sales", "Spot Gas Sales", "Transport Fee", "Distribution Charges", "Adjustment Charges", "Other Charges"]
-    out["Charge Category"] = pd.Categorical(out["Charge Category"], order, ordered=True)
-    out = out.sort_values(["Charge Category","Charge Type"]).reset_index(drop=True)
+
+    # Ordering for UI
+    category_order = [
+        "Firm Gas Sales", "Overrun Charges", "Transport Fee",
+        "Distribution Charges", "Adjustment Charges", "Other Charges"
+    ]
+    out["Charge Category"] = pd.Categorical(out["Charge Category"], category_order, ordered=True)
+
+    # Sort nicely for PDF
+    out = out.sort_values(["Charge Category", "Charge Type"]).reset_index(drop=True)
     return out
 
-
-# Mapping breakdown -> billing_history columns
-CHARGE_TYPE_TO_COL = {
-    "Firm Gas Sales":                       "firm_gas_amount",
-    "Spot Gas Sales":                       "spot_gas_amount",
-    "Transport Fee on Firm Capacity":       "transport_firm_amount",
-    "Deliveries above Firm Capacity":       "transport_overrun_amount",
-    "ATCO Usage Charges":                   "atco_usage_amount",
-    "ATCO Demand Charges":                  "atco_demand_amount",
-    "ATCO Standing Charges":                "atco_standing_amount",
-    "Gas Adjustment Charges":               "gas_adjustment_charges",
-    "Distribution Adjustment Charges":      "distribution_adjustment_charges",
-    "Regulatory Adjustment Charges":        "regulatory_adjustment_charges",
-    "Admin Fee":                            "admin_fee",
-    "Late Payment Fee":                     "late_payment_fee",
-}
+# ========================================= Billing History =========================================
+def ensure_billing_history_table(engine) -> None:
+    q = """
+    SELECT 1
+    FROM sys.objects
+    WHERE object_id = OBJECT_ID(N'dbo.billing_history')
+      AND type = N'U'
+    """
+    with engine.begin() as con:
+        row = con.exec_driver_sql(q).fetchone()
+        if row is None:
+            raise RuntimeError("Table dbo.billing_history does not exist. Please create it first.")
 
 def build_history_row_from_monthly(m: pd.Series) -> Dict[str, Any]:
-    """
-    Build a dbo.billing_history row from a single vw_billing_charges_monthly row.
-    Robust to small column-name variations.
-    """
-    def get(*names, **kw):
-        default = kw.get("default", None)
-        for n in names:
-            if n in m and pd.notna(m[n]):
-                return m[n]
+    """Build a clean and stable history row from the monthly dataframe row."""
+
+    def get(name, default=None):
+        if name in m and pd.notna(m[name]):
+            return m[name]
         return default
 
-    # Dates
-    bs = pd.to_datetime(get("bill_start_date", "start_date"), errors="coerce")
-    be = pd.to_datetime(get("bill_end_date", "end_date"), errors="coerce")
-    billing_days = get("billing_days")
-    if pd.isna(billing_days) and bs is not None and be is not None:
-        billing_days = int((bs.normalize() - pd.Timestamp("1970-01-01")).days - (be.normalize() - pd.Timestamp("1970-01-01")).days)
-        billing_days = abs(billing_days) + 1
+    def f(v):
+        # numeric safe float
+        if v in (None, ""):
+            return 0.0
+        try:
+            return float(v)
+        except Exception:
+            return 0.0
 
-    # Totals (prefer explicit inc-GST if present)
-    total_ex  = get("total_amount", "total_ex_gst", default=0)
-    gst_amt   = get("gst_amount", "gst", default=0)
-    total_inc = get("total_in_gst_amount", "total_inc_gst")
-    if total_inc is None:
-        total_inc = (float(total_ex or 0) + float(gst_amt or 0))
+    bill_start_date = pd.to_datetime(get("bill_start_date"), errors="coerce")
+    bill_end_date   = pd.to_datetime(get("bill_end_date"), errors="coerce")
+    bill_issue_date = pd.to_datetime(get("bill_issue_date"), errors="coerce")
+    read_start_date = pd.to_datetime(get("read_start_date"), errors="coerce")
+    read_end_date   = pd.to_datetime(get("read_end_date"), errors="coerce")
 
-    amount_cols = [
-        "firm_gas_amount","spot_gas_amount",
-        "transport_firm_amount","transport_overrun_amount",
-        "atco_usage_amount","atco_demand_amount","atco_standing_amount",
-        "gas_adjustment_charges","distribution_adjustment_charges","regulatory_adjustment_charges",
-        "admin_fee","late_payment_fee",
-    ]
+    total_amount = get("total_amount", default=0)
+    gst_amount   = get("gst_amount", default=0)
+    total_in_gst_amount = get("total_in_gst_amount")
+    if total_in_gst_amount is None:
+        total_in_gst_amount = f(total_amount) + f(gst_amount)
 
-    h: Dict[str, Any] = {
-        "invoice_number":        get("invoice_number"),
-        "purchase_order_number": get("purchase_order_number","po_number"),
-        "company_name":          get("company_name"),
-        "company_code":          get("company_code"),
-        "account_number":        get("account_number"),
-        "mirn":                  get("mirn"),
-        "distributor":           get("distributor","network","distributor_name"),
-        "bill_start_date":       bs,
-        "bill_end_date":         be,
-        "billing_days":          billing_days,
-        "bill_issue_date":       pd.to_datetime(get("bill_issue_date","issue_date"), errors="coerce"),
-        "total_amount":          float(total_ex or 0),
-        "gst_amount":            float(gst_amt or 0),
-        "total_in_gst_amount":   float(total_inc or 0),
-        "generated_at_utc":      datetime.utcnow()
+    statement_total_amount = get("statement_total_amount", default=0)
+    statement_gst_amount   = get("statement_gst_amount", default=0)
+    statement_total_in_gst_amount = get("statement_total_in_gst_amount")
+    if statement_total_in_gst_amount is None:
+        statement_total_in_gst_amount = f(statement_total_amount) + f(statement_gst_amount)
+
+    statement_total_amount_payable = get("statement_total_amount_payable", default=0)
+    total_amount_payable = get("total_amount_payable", default=0)
+
+    h = {
+        # Base identifiers
+        "invoice_agg_code": get("invoice_agg_code"),
+        "item_listed_bills": get("item_listed_bills"),
+        "billing_days": get("billing_days"),
+        "statement_number": get("statement_number"),
+        "invoice_number": get("invoice_number"),
+        "purchase_order_number": get("purchase_order_number"),
+
+        # Company & account
+        "company_name": get("company_name"),
+        "company_code": get("company_code"),
+        "account_number": get("account_number"),
+        "mirn": get("mirn"),
+        "distributor": get("distributor"),
+        "site_name": get("site_name"),
+
+        # Billing period
+        "bill_start_date": bill_start_date,
+        "bill_end_date": bill_end_date,
+        "bill_issue_date": bill_issue_date,
+        "payment_term": get("payment_term"),
+
+        # Read dates
+        "read_start_date": read_start_date,
+        "read_end_date": read_end_date,
+
+        # Core charges
+        "gj_consumption": f(get("gj_consumption")),
+        "firm_gas_amount": f(get("firm_gas_amount")),
+        "spot_gas_amount": f(get("spot_gas_amount")),
+        "atco_usage_amount": f(get("atco_usage_amount")),
+        "atco_demand_amount": f(get("atco_demand_amount")),
+        "atco_standing_amount": f(get("atco_standing_amount")),
+        "transport_firm_amount": f(get("transport_firm_amount")),
+        "transport_overrun_amount": f(get("transport_overrun_amount")),
+        "gas_adjustment_charges": f(get("gas_adjustment_charges")),
+        "distribution_adjustment_charges": f(get("distribution_adjustment_charges")),
+        "regulatory_adjustment_charges": f(get("regulatory_adjustment_charges")),
+        "admin_fee": f(get("admin_fee")),
+        "welcome_credit": f(get("welcome_credit")),
+        "late_payment_fee": f(get("late_payment_fee")),
+
+        # Balances (Monthly-level)
+        "opening_balance": f(get("opening_balance")),
+        "payment_received": f(get("payment_received")),
+        "balance_carried_forward": f(get("balance_carried_forward")),
+
+        # Balances (Statement-level)
+        "statement_opening_balance": f(get("statement_opening_balance")),
+        "statement_payment_received": f(get("statement_payment_received")),
+        "statement_balance_carried_forward": f(get("statement_balance_carried_forward")),
+
+        # ✅ Totals (FIXED)
+        "total_amount": f(total_amount),
+        "gst_amount": f(gst_amount),
+        "total_in_gst_amount": f(total_in_gst_amount),
+        "statement_total_amount": f(statement_total_amount),
+        "statement_gst_amount": f(statement_gst_amount),
+        "statement_total_in_gst_amount": f(statement_total_in_gst_amount),
+        "total_amount_payable": f(total_amount_payable),
+        "statement_total_amount_payable": f(statement_total_amount_payable),
+
+        # audit field
+        "generated_at_utc": datetime.utcnow(),
     }
-
-    for c in amount_cols:
-        h[c] = float(get(c, default=0) or 0)
 
     return h
 
+def sanitize_history_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    cleaned: List[Dict[str, Any]] = []
+
+    for r in rows:
+        out: Dict[str, Any] = {
+            # Identifiers
+            "invoice_agg_code":                _to_str_or_none(r.get("invoice_agg_code")),
+            "item_listed_bills":               _to_str_or_none(r.get("item_listed_bills")),
+            "statement_number":                _to_str_or_none(r.get("statement_number")),
+            "invoice_number":                  _to_str_or_none(r.get("invoice_number")),
+            "purchase_order_number":           _to_str_or_none(r.get("purchase_order_number")),
+            "company_name":                    _to_str_or_none(r.get("company_name")),
+            "company_code":                    _to_str_or_none(r.get("company_code")),
+            "account_number":                  _to_str_or_none(r.get("account_number")),
+            "mirn":                            _to_str_or_none(r.get("mirn")),
+            "distributor":                     _to_str_or_none(r.get("distributor")),
+            "site_name":                       _to_str_or_none(r.get("site_name")),
+            "billing_email":                   _to_str_or_none(r.get("billing_email")),
+            "billing_days":                    _to_int_or_none(r.get("billing_days")),
+
+            # Dates
+            "bill_start_date":                 _to_date_or_none(r.get("bill_start_date")),
+            "bill_end_date":                   _to_date_or_none(r.get("bill_end_date")),
+            "bill_issue_date":                 _to_date_or_none(r.get("bill_issue_date")),
+            "payment_term":                     r.get("payment_term"),
+            "read_start_date":                 _to_date_or_none(r.get("read_start_date")),
+            "read_end_date":                   _to_date_or_none(r.get("read_end_date")),
+
+            # Balances (Monthly-level)
+            "opening_balance":                 _to_float_or_none(r.get("opening_balance")),
+            "payment_received":                _to_float_or_none(r.get("payment_received")),
+            "balance_carried_forward":         _to_float_or_none(r.get("balance_carried_forward")),
+
+            # Balances (Statement-level)
+            "statement_opening_balance":       _to_float_or_none(r.get("statement_opening_balance")),
+            "statement_payment_received":      _to_float_or_none(r.get("statement_payment_received")),
+            "statement_balance_carried_forward": _to_float_or_none(r.get("statement_balance_carried_forward")),
+            "gj_consumption":                  _to_float_or_none(r.get("gj_consumption")),
+
+            # Charges
+            "firm_gas_amount":                 _to_float_or_none(r.get("firm_gas_amount")),
+            "spot_gas_amount":                 _to_float_or_none(r.get("spot_gas_amount")),
+            "atco_usage_amount":               _to_float_or_none(r.get("atco_usage_amount")),
+            "atco_demand_amount":              _to_float_or_none(r.get("atco_demand_amount")),
+            "atco_standing_amount":            _to_float_or_none(r.get("atco_standing_amount")),
+            "transport_firm_amount":           _to_float_or_none(r.get("transport_firm_amount")),
+            "transport_overrun_amount":        _to_float_or_none(r.get("transport_overrun_amount")),
+            "gas_adjustment_charges":          _to_float_or_none(r.get("gas_adjustment_charges")),
+            "distribution_adjustment_charges": _to_float_or_none(r.get("distribution_adjustment_charges")),
+            "regulatory_adjustment_charges":   _to_float_or_none(r.get("regulatory_adjustment_charges")),
+            "admin_fee":                       _to_float_or_none(r.get("admin_fee")),
+            "welcome_credit":                  _to_float_or_none(r.get("welcome_credit")),
+            "late_payment_fee":                _to_float_or_none(r.get("late_payment_fee")),
+
+            # Totals
+            "total_amount":                    _to_float_or_none(r.get("total_amount")),
+            "gst_amount":                      _to_float_or_none(r.get("gst_amount")),
+            "total_in_gst_amount":             _to_float_or_none(r.get("total_in_gst_amount")),
+            "statement_total_amount":          _to_float_or_none(r.get("statement_total_amount")),
+            "statement_gst_amount":            _to_float_or_none(r.get("statement_gst_amount")),
+            "statement_total_in_gst_amount":   _to_float_or_none(r.get("statement_total_in_gst_amount")),
+            "total_amount_payable":            _to_float_or_none(r.get("total_amount_payable")),
+            "statement_total_amount_payable":   _to_float_or_none(r.get("statement_total_amount_payable")),
+            # System field
+            "generated_at_utc":                _to_datetime_or_none(r.get("generated_at_utc") or datetime.utcnow()),
+        }
+
+        # Skip invalid rows (required rule)
+        if not out["invoice_number"]:
+            continue
+
+        cleaned.append(out)
+
+    return cleaned
 
 # =========================
 # Charts
@@ -341,9 +556,9 @@ def generate_pie_chart(breakdown_series: pd.Series, custom_colors_map: Dict[str,
 
     wedges, _, autotexts = ax.pie(
         breakdown_series.values,
-        autopct=lambda p: f"{int(round(p))}%",  # integer percent inline
+        autopct=lambda p: f"{int(round(p))}%", 
         startangle=90,
-        pctdistance=1.12,
+        pctdistance=0.65,
         colors=colors,
         textprops={"fontsize": 8, "color": "black"}
     )
@@ -356,7 +571,6 @@ def generate_pie_chart(breakdown_series: pd.Series, custom_colors_map: Dict[str,
         percent = autotext.get_text()
         autotext.set_text("")
         x, y = autotext.get_position()
-        ax.text(x - 0.04, y, "●", color=color, fontsize=9, ha="center", va="center")
         ax.text(x + 0.04, y, percent, color="black", fontsize=8, ha="left", va="center")
 
     # Build custom legend below
@@ -387,7 +601,7 @@ def generate_pie_chart(breakdown_series: pd.Series, custom_colors_map: Dict[str,
 
 def generate_consumption_chart(
     mirn: str,
-    billing_period: str,
+    read_period: str,
     cust_consumption_df: pd.DataFrame,
     contract_mdq: Optional[float],
     fig_height_mm: float = 80.0
@@ -403,6 +617,9 @@ def generate_consumption_chart(
         return BytesIO()
 
     start_date = df["gas_date"].min()
+    if pd.isna(start_date) and df["pre_read_date"] is not None:
+        start_date = df["pre_read_date"]
+
     end_date = df["gas_date"].max()
 
     fig_width_mm = 180.0
@@ -415,7 +632,7 @@ def generate_consumption_chart(
 
     fig.subplots_adjust(left=0.12, right=0.98, top=0.94, bottom=0.32)
 
-    ax.set_title(f"MIRN: {mirn}    Period: {billing_period}", fontsize=7, fontweight="normal", pad=4)
+    ax.set_title(f"MIRN: {mirn}    Read Period (Current Billing Cycle): {read_period}", fontsize=7, fontweight="bold", pad=4)
 
     ax.bar(df["gas_date"], df["gj_consumption"], label="Daily Consumption", alpha=0.95, color="#0089D0")
 
@@ -465,7 +682,89 @@ def generate_consumption_chart(
     plt.close(fig)
     return buf_c
 
-def generate_accounts_mirn_chart(billing_period: str, df: pd.DataFrame, selected_mirns: list) -> BytesIO:
+def generate_consumption_chart_basic(
+    mirn: str,
+    basic_read_period: str,
+    basic_cust_consumption_df: pd.DataFrame,
+    contract_mdq: Optional[float],
+    fig_height_mm: float = 80.0
+) -> BytesIO:
+    if basic_cust_consumption_df.empty:
+        return BytesIO()
+
+    df = basic_cust_consumption_df.copy()
+    df["cur_read_date"] = pd.to_datetime(df["cur_read_date"], errors="coerce")
+    df["gj_consumption"] = pd.to_numeric(df["gj_consumption"], errors="coerce")
+    df = df.dropna(subset=["cur_read_date", "gj_consumption"]).sort_values("cur_read_date")
+    if df.empty:
+        return BytesIO()
+
+    max_date = df["cur_read_date"].max()
+
+    start_date = (max_date - pd.DateOffset(months=5)).normalize().replace(day=1)
+
+    end_date = max_date + pd.offsets.MonthEnd(0)
+
+    fig_width_mm = 180.0
+    fig = plt.figure(figsize=(fig_width_mm / 25.4, fig_height_mm / 25.4))
+    ax = fig.add_subplot(111)
+
+    light_blue = "#f0f8ff"
+    fig.patch.set_facecolor(light_blue)
+    ax.set_facecolor(light_blue)
+
+    fig.subplots_adjust(left=0.12, right=0.98, top=0.94, bottom=0.32)
+
+    ax.set_title(f"MIRN: {mirn}    Read Period (Current Billing Cycle): {basic_read_period}", fontsize=7, fontweight="bold", pad=4)
+
+    ax.bar(df["cur_read_date"], df["gj_consumption"], width=10, label="Consumption", alpha=0.95, color="#0089D0")
+
+    ax.set_xlim(start_date - pd.Timedelta(days=0.7), end_date + pd.Timedelta(days=0.7))
+    ax.xaxis.set_major_locator(mdates.MonthLocator(interval=1))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+    ax.margins(x=0.0005)
+
+    ax.tick_params(axis="x", labelrotation=45, labelsize=6, pad=3, length=0)
+    for lbl in ax.get_xticklabels():
+        lbl.set_fontweight("bold")
+
+    ymax = float(df["gj_consumption"].max() or 0)
+    ax.set_ylim(0, ymax * 1.08 if ymax > 0 else 10)
+    ax.set_axisbelow(True)
+    ax.grid(which="both", axis="both", linestyle="--", linewidth=0.5)
+    ax.tick_params(axis="y", labelsize=6)
+    for s in ("top", "right", "left"):
+        ax.spines[s].set_visible(False)
+    ax.spines["bottom"].set_linewidth(1)
+
+    handles, labels = ax.get_legend_handles_labels()
+    if handles:
+        fig.legend(
+            handles, labels,
+            loc="lower center",
+            bbox_to_anchor=(0.5, -0.1),
+            ncol=max(1, len(labels)),
+            frameon=False,
+            prop=FontProperties(size=6, weight="bold")
+        )
+
+    buf_c = BytesIO()
+    fig.savefig(buf_c, format="png", dpi=300, bbox_inches="tight", facecolor=fig.get_facecolor())
+    buf_c.seek(0)
+    plt.close(fig)
+    return buf_c
+
+def generate_accounts_mirn_chart(
+    read_period: str,
+    df: pd.DataFrame,
+    selected_mirns: list = None,
+    customer_number: str = None,
+    stack_consumption_chart_only: bool = False,
+    aggregated_contract_mdq: float = None,
+    period_start: pd.Timestamp = None,
+    period_end: pd.Timestamp = None
+) -> BytesIO:
+    
     if df.empty:
         return BytesIO()
 
@@ -478,18 +777,43 @@ def generate_accounts_mirn_chart(billing_period: str, df: pd.DataFrame, selected
     if use.empty:
         return BytesIO()
     
-    use = use[use["mirn"].isin(selected_mirns)]
-    if use.empty:
-        return BytesIO()
-    
-    piv = use.pivot_table(index="gas_date", columns="mirn", values="gj_consumption", aggfunc="sum")
+    if customer_number:
+        use = use[use["customer_number"].astype(str) == str(customer_number)]
+        if use.empty:
+            return BytesIO()
 
-    start_date = piv.index.min()
-    end_date   = piv.index.max()
+    if stack_consumption_chart_only and "stack_consumption_chart" in use.columns:
+        use = use[use["stack_consumption_chart"] == "Yes"]
+        if use.empty:
+            return BytesIO()
+    
+    piv = use.pivot_table(
+        index="gas_date",
+        columns="mirn",
+        values="gj_consumption",
+        aggfunc="sum"
+    )
+
+    piv_start = piv.index.min()
+    piv_end   = piv.index.max()
+
+    # Determine chart start/end
+    start_date = period_start or piv_start
+    end_date   = period_end or piv_end
+    current_period = f"{start_date.strftime('%d-%b-%y')} to {end_date.strftime('%d-%b-%y')}"
+
+
+    full_index = pd.date_range(start=start_date, end=end_date, freq="D")
+    piv = piv.reindex(full_index, fill_value=0)
+
+    # Re-assign columns, index
+    cols = sorted(list(piv.columns))
+    x = piv.index
+    bottom = np.zeros(len(piv), dtype=float)
+
     if pd.isna(start_date) or pd.isna(end_date):
         return BytesIO()
     
-
     fig_width_mm = 180
     fig_height_mm: float = 32.0
     fig = plt.figure(figsize=(fig_width_mm / 25.4, fig_height_mm / 25.4))
@@ -501,44 +825,60 @@ def generate_accounts_mirn_chart(billing_period: str, df: pd.DataFrame, selected
 
     fig.subplots_adjust(left=0.12, right=0.98, top=0.94, bottom=0.32)
 
-    ax.set_title(f"MIRN: Aggregated Consumption    Period: {billing_period}",
-                 fontsize=6, fontweight="normal", pad=4)
+    ax.set_title(f"MIRN: Aggregated Consumption    Read Period (Current Billing Cycle): {current_period}",
+                 fontsize=7, fontweight="bold", pad=4)
 
-    cols = sorted(list(piv.columns))
-    x = piv.index
-    bottom = np.zeros(len(piv), dtype=float)
+    all_prefixes = sorted({str(m)[:10] for m in piv.columns})
 
-    color_map = {
-        "5600002119_8": "#2A9D8F",
-        "5600002162_7": "#FE9666",
-        "5600462393_7": "#A0A0A0",
+    palette = [
+        "#2A9D8F", "#FE9666", "#A0A0A0", "#264653", "#E76F51",
+        "#8AB17D", "#F4A261", "#6D6875", "#FF9F1C", "#2E4057",
+        "#9D4EDD", "#00A896", "#FF6B6B", "#3A86FF", "#8338EC",
+    ] 
+
+    prefix_color_map = {
+        prefix: palette[i % len(palette)]
+        for i, prefix in enumerate(all_prefixes)
     }
-    fallback_palette = ["#264653"]
 
     for i, c in enumerate(cols):
+        mirn_prefix = str(c)[:10]
+        color = prefix_color_map.get(mirn_prefix, "#264653")
+
         y = piv[c].values.astype(float)
         ax.bar(
             x, y,
             bottom=bottom,
             label=c,
             alpha=0.95,
-            color=color_map.get(str(c), fallback_palette[i % len(fallback_palette)])
+            color=color
         )
         bottom += np.nan_to_num(y, nan=0.0)
 
-    ax.axhline(y=3000, linewidth=1.5, color="#000000", label="Aggregated MDQ.", zorder=3)
+        # --- Safe convert aggregated MDQ ---
+        try:
+            aggregated_contract_mdq = float(aggregated_contract_mdq)
+        except Exception:
+            aggregated_contract_mdq = None
 
-    ax.set_xlim(start_date - pd.Timedelta(days=0.7), end_date + pd.Timedelta(days=0.7))
-    ax.xaxis.set_major_locator(mdates.DayLocator(interval=1))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
-    ax.margins(x=0.005)
+    # --- Draw Aggregated MDQ line only if valid ---
+    if aggregated_contract_mdq is not None and aggregated_contract_mdq > 0:
+        ax.axhline(
+            y=aggregated_contract_mdq,
+            linewidth=1.5,
+            color="#000000",
+            label="Aggregated MDQ.",
+            zorder=3
+        )
 
-    ax.tick_params(axis="x", labelrotation=45, labelsize=6, pad=3, length=0)
-    for lbl in ax.get_xticklabels():
-        lbl.set_fontweight("bold")
-
+    # --- Safe ymax calculation ---
     max_stack = float(np.nanmax(bottom)) if len(bottom) else 0.0
-    ymax = max(max_stack, 3000.0)
+
+    if aggregated_contract_mdq is None:
+        ymax = max_stack
+    else:
+        ymax = max(max_stack, aggregated_contract_mdq)
+
     ax.set_ylim(0, ymax * 1.08 if ymax > 0 else 10)
     ax.set_axisbelow(True)
     ax.grid(which="both", axis="both", linestyle="--", linewidth=0.5)
@@ -546,7 +886,7 @@ def generate_accounts_mirn_chart(billing_period: str, df: pd.DataFrame, selected
     for s in ("top", "right", "left"):
         ax.spines[s].set_visible(False)
     ax.spines["bottom"].set_linewidth(1)
-
+        
     # Adding legend for 'mirn'
     handles, labels = ax.get_legend_handles_labels()
     ncols = max(1, len(labels))
@@ -557,7 +897,26 @@ def generate_accounts_mirn_chart(billing_period: str, df: pd.DataFrame, selected
         ncol=ncols,
         frameon=False,
         prop=FontProperties(size=6, weight="bold")
+    )    
+    
+    ax.set_xlim(
+        start_date - pd.Timedelta(days=1),
+        end_date   + pd.Timedelta(days=1)
     )
+
+    # Build tick marks ONLY for billing-period range
+    tick_positions = pd.date_range(start=start_date, end=end_date, freq="D")
+
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels(
+        [d.strftime("%d %b") for d in tick_positions],
+        rotation=45,
+        fontsize=6
+    )
+
+    for lbl in ax.get_xticklabels():
+        lbl.set_fontweight("bold")
+    ax.tick_params(axis="x", length=0)
 
     buf_m = BytesIO()
     fig.savefig(buf_m, format="png", dpi=300, bbox_inches="tight", facecolor=fig.get_facecolor())
@@ -565,7 +924,8 @@ def generate_accounts_mirn_chart(billing_period: str, df: pd.DataFrame, selected
     plt.close(fig)
     return buf_m
 
-def embed_chart_in_pdf(pdf: FPDF, chart_buf: BytesIO, chart_height_mm: float) -> None:
+def embed_chart_in_pdf(pdf: FPDF, chart_buf: BytesIO, chart_height_mm: float, logger: Optional[logging.Logger] = None) -> None:
+    logger = logger or logging.getLogger("SharePointLogger")
     """
     Embeds a chart (from a BytesIO buffer) into the PDF.
     
@@ -577,7 +937,7 @@ def embed_chart_in_pdf(pdf: FPDF, chart_buf: BytesIO, chart_height_mm: float) ->
     # Check the size of the chart buffer before embedding
     chart_size = len(chart_buf.getvalue())
     if chart_size == 0:
-        logger.error("The chart buffer is empty. Skipping chart embedding.")
+        logger.error("⏭️ The chart buffer is empty. Skipping chart embedding.")
         return
 
     y_start = pdf.get_y()  # Current y position of the PDF
@@ -600,14 +960,17 @@ def _to_float_or_none(x: Any) -> Optional[float]:
         return float(x)
     except Exception:
         return None
-
-def _to_int_or_none(x: Any) -> Optional[int]:
-    try:
-        if x is None or (isinstance(x, float) and np.isnan(x)):
-            return None
-        return int(x)
-    except Exception:
+    
+def _to_int_or_none(v):
+    if v is None or v == "":
         return None
+    try:
+        return int(v)
+    except:
+        try:
+            return int(float(v))
+        except:
+            return None
 
 def _to_date_or_none(x: Any) -> Optional[date]:
     try:
@@ -631,148 +994,452 @@ def _to_datetime_or_none(x: Any) -> Optional[datetime]:
     except Exception:
         return None
 
-def sanitize_history_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    cleaned: List[Dict[str, Any]] = []
-    for r in rows:
-        out: Dict[str, Any] = {
-            "invoice_number":                  _to_str_or_none(r.get("invoice_number")),
-            "purchase_order_number":           _to_str_or_none(r.get("purchase_order_number")),
-            "company_name":                    _to_str_or_none(r.get("company_name")),
-            "company_code":                    _to_str_or_none(r.get("company_code")),
-            "account_number":                  _to_str_or_none(r.get("account_number")),
-            "mirn":                            _to_str_or_none(r.get("mirn")),
-            "distributor":                     _to_str_or_none(r.get("distributor")),
-            "bill_start_date":                 _to_date_or_none(r.get("bill_start_date")),
-            "bill_end_date":                   _to_date_or_none(r.get("bill_end_date")),
-            "billing_days":                    _to_int_or_none(r.get("billing_days")),
-            "bill_issue_date":                 _to_date_or_none(r.get("bill_issue_date")),
-            "firm_gas_amount":                 _to_float_or_none(r.get("firm_gas_amount")),
-            "spot_gas_amount":                 _to_float_or_none(r.get("spot_gas_amount")),
-            "atco_usage_amount":               _to_float_or_none(r.get("atco_usage_amount")),
-            "atco_demand_amount":              _to_float_or_none(r.get("atco_demand_amount")),
-            "atco_standing_amount":            _to_float_or_none(r.get("atco_standing_amount")),
-            "transport_firm_amount":           _to_float_or_none(r.get("transport_firm_amount")),
-            "transport_overrun_amount":        _to_float_or_none(r.get("transport_overrun_amount")),
-            "gas_adjustment_charges":          _to_float_or_none(r.get("gas_adjustment_charges")),
-            "distribution_adjustment_charges": _to_float_or_none(r.get("distribution_adjustment_charges")),
-            "regulatory_adjustment_charges":   _to_float_or_none(r.get("regulatory_adjustment_charges")),
-            "admin_fee":                       _to_float_or_none(r.get("admin_fee")),
-            "late_payment_fee":                _to_float_or_none(r.get("late_payment_fee")),
-            "total_amount":                    _to_float_or_none(r.get("total_amount")),
-            "gst_amount":                      _to_float_or_none(r.get("gst_amount")),
-            "total_in_gst_amount":             _to_float_or_none(r.get("total_in_gst_amount")),
-            "generated_at_utc":                _to_datetime_or_none(r.get("generated_at_utc") or datetime.utcnow()),
-        }
-        if not out["invoice_number"]:
-            continue
-        cleaned.append(out)
-    return cleaned
-
 def _norm2(x: Any) -> Decimal:
     """Two-decimal money for equality compares."""
     if x is None or (isinstance(x, float) and pd.isna(x)):
         x = "0"
     return Decimal(str(x)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
-def _fetch_history_variants(engine, base_invoice_no: str) -> List[Tuple[str, int, Decimal]]:
+def _fetch_history_variants(engine, base_invoice_number: str) -> List[Tuple[str, int, Decimal]]:
     """
     Returns list of tuples (invoice_number, suffix_int, total_inc_norm)
     Only rows where invoice_number == base OR base_\\d+ are kept.
     """
-    like = base_invoice_no + "%"
-    sql = f"SELECT invoice_number, total_in_gst_amount FROM {HISTORY_TABLE} WHERE invoice_number LIKE ?"
-    pat = re.compile(r"^" + re.escape(base_invoice_no) + r"(?:_(\d+))?$")
+    like = base_invoice_number + "%"
+    sql = f"SELECT invoice_number, total_amount_payable FROM {HISTORY_TABLE} WHERE invoice_number LIKE ?"
+    pat = re.compile(r"^" + re.escape(base_invoice_number) + r"(?:_(\d+))?$")
 
     with engine.begin() as con:
         rows = con.exec_driver_sql(sql, (like,)).fetchall()
 
     variants: List[Tuple[str, int, Decimal]] = []
-    for inv, total_inc in rows:
+    for inv, total_amount_payable in rows:
         m = pat.match(inv or "")
         if not m:
             continue
         sfx = int(m.group(1) or "1")  # base counted as 1
-        variants.append((inv, sfx, _norm2(total_inc)))
+        variants.append((inv, sfx, _norm2(total_amount_payable)))
     return variants
 
-def _apply_history_increment_rule(engine, row: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str, bool]:
+def _fetch_statement_variants(engine, base_statement_number: str) -> List[Tuple[str, int, Decimal]]:
     """
-    One history row per invoice_number unless the *same invoice_number* has a different total:
-      - If any existing variant (base or suffixed) has the SAME total -> SKIP insert and return that variant's invoice_no.
-      - Else create next suffix and INSERT.
-      - If no variants exist -> INSERT base as-is.
+    Returns list of tuples (statement_number, suffix_int, total_inc_norm)
+    Only rows where statement_number == base OR base_\\d+ are kept.
+    """
+    like = base_statement_number + "%"
+    sql = f"""
+        SELECT statement_number, total_amount_payable
+        FROM {HISTORY_TABLE}
+        WHERE statement_number LIKE ?
+    """
+    pat = re.compile(r"^" + re.escape(base_statement_number) + r"(?:_(\d+))?$")
 
-    Returns: (row_to_insert_or_None, invoice_no_used, inserted_bool)
+    with engine.begin() as con:
+        rows = con.exec_driver_sql(sql, (like,)).fetchall()
+
+    variants: List[Tuple[str, int, Decimal]] = []
+    for st_no, total_amount_payable in rows:
+        m = pat.match(st_no or "")
+        if not m:
+            continue
+        sfx = int(m.group(1) or "1")   # base counted as 1
+        variants.append((st_no, sfx, _norm2(total_amount_payable)))
+
+    return variants
+
+def _strip_pdf_ext(name: str) -> str:
+    return name[:-4] if isinstance(name, str) and name.lower().endswith(".pdf") else name
+
+def _strip_suffix_variant(x: str) -> str:
     """
-    base = row.get("invoice_number")
+    INV123_2 -> INV123
+    INV123 -> INV123
+    Only strips a trailing _<digits>.
+    """
+    s = _norm_id(x)
+    m = re.fullmatch(r"(.+?)_(\d+)$", s)
+    return m.group(1) if m else s
+
+def _money2(x):
+    if x is None:
+        return None
+    try:
+        xf = float(x)
+        if math.isnan(xf) or math.isinf(xf):
+            return None
+        return round(xf, 2)
+    except Exception:
+        return None
+
+def build_statement_content_hash(
+    invoices: Iterable[Tuple[str, float]]
+) -> str:
+    """
+    invoices: iterable of (invoice_number, invoice_total_in_gst)
+    """
+    norm = [(str(inv).strip(), str(_money2(amt))) for inv, amt in invoices]
+    norm.sort(key=lambda t: t[0])  # stable order
+    payload = "|".join(f"{inv}:{amt}" for inv, amt in norm)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+@dataclass
+class StatementRunCache:
+    chosen_name_by_base: dict[str, str] = field(default_factory=dict)
+    emitted: set[str] = field(default_factory=set)
+
+def _suffix_num(base: str, stmt: str) -> int:
+    """base -> 0 (meaning 'base'), base_2 -> 2, etc"""
+    if stmt == base:
+        return 0
+    m = re.fullmatch(re.escape(base) + r"_(\d+)", stmt)
+    return int(m.group(1)) if m else 0
+
+def _db_list_statement_variants(engine, base: str) -> List[str]:
+    sql = f"""
+        SELECT DISTINCT statement_number
+        FROM {HISTORY_TABLE}
+        WHERE statement_number = ? OR statement_number LIKE ?
+    """
+    like = f"{base}_%"
+    with engine.begin() as con:
+        rows = con.exec_driver_sql(sql, (base, like)).fetchall()
+    return [r[0] for r in rows if r and r[0]]
+
+def _db_get_statement_meta(engine, stmt_no: str) -> Dict[str, Any]:
+    # if you DON'T have content_hash column yet, just return total
+    sql = f"""
+        SELECT TOP 1 statement_total_amount_payable
+        FROM {HISTORY_TABLE}
+        WHERE statement_number = ?
+        ORDER BY generated_at_utc DESC
+    """
+    with engine.begin() as con:
+        row = con.exec_driver_sql(sql, (stmt_no,)).fetchone()
+    if not row:
+        return {}
+    return {"total": row[0], "content_hash": None}
+
+def _db_get_statement_signature(engine, stmt_no: str) -> Dict[str, Any]:
+    """
+    Build a stable signature for a statement from dbo.billing_history.
+    This avoids needing a content_hash column.
+    """
+    sql = f"""
+        SELECT invoice_number, total_amount_payable, statement_total_amount_payable
+        FROM {HISTORY_TABLE}
+        WHERE statement_number = ?
+    """
+    with engine.begin() as con:
+        rows = con.exec_driver_sql(sql, (stmt_no,)).fetchall()
+
+    if not rows:
+        return {}
+
+    invoices = []
+    stmt_totals = []
+    for inv_no, inv_total, stmt_total in rows:
+        if inv_no:
+            inv_no_s = _norm_id(inv_no)
+            invoices.append((inv_no_s, round(float(inv_total or 0.0), 2)))
+        if stmt_total is not None:
+            stmt_totals.append(round(float(stmt_total), 2))
+
+    sig = {
+        "content_hash": build_statement_content_hash(invoices),
+        # statement total should be identical across rows; pick max defensively
+        "total": max(stmt_totals) if stmt_totals else None,
+    }
+    return sig
+
+def _root_base(stmt: str) -> str:
+    """
+    Only strips a duplicate suffix like _2 or _10.
+    Will NOT strip account numbers like _30013.
+    """
+    s = (stmt or "").strip()
+    parts = s.split("_")
+    if len(parts) >= 4 and parts[-1].isdigit() and len(parts[-1]) <= 3:
+        # Only treat as suffix if previous segment looks like an account number
+        if parts[-2].isdigit() and len(parts[-2]) >= 4:
+            return "_".join(parts[:-1])
+    return s
+
+def _norm_id(x) -> str:
+    if x is None:
+        return ""
+    s = str(x).strip()
+
+    # pandas float artifact: "30013.0" -> "30013"
+    if s.endswith(".0") and s[:-2].isdigit():
+        s = s[:-2]
+
+    return s
+
+def should_process_statement(
+    eng,
+    statement_number: str,
+    statement_total_amount_payable: float,
+    *,
+    content_hash: Optional[str] = None,
+    run_cache: Optional[StatementRunCache] = None,
+    sp_index: Optional["SharePointFolderIndex"] = None,
+    logger: Optional[logging.Logger] = None,
+) -> Tuple[bool, str]:
+
+    logger = logger or logging.getLogger(__name__)
+
+    base_in = (statement_number or "").strip()
+    if not base_in:
+        return True, base_in
+
+    root = _root_base(base_in)
+
+    # ---- prevent re-suffixing in same run ----
+    # Use ROOT as the key so TRI_... and TRI_..._2 share one decision.
+    if run_cache and root in run_cache.chosen_name_by_base:
+        chosen = run_cache.chosen_name_by_base[root]
+        if chosen in run_cache.emitted:
+            return False, chosen
+        run_cache.emitted.add(chosen)
+        return True, chosen
+
+    curr_total = _money2(statement_total_amount_payable)
+    curr_hash = content_hash or f"TOTAL:{curr_total}"
+
+    # DB variants (scan using ROOT)
+    db_variants = _db_list_statement_variants(eng, root)
+
+    # SP variants (scan using ROOT)
+    sp_variants = []
+    if sp_index:
+        try:
+            sp_variants = sp_index.list_variants_stem(root)  # must be ["ROOT", "ROOT_2", ...]
+        except Exception as e:
+            logger.warning(f"SharePoint variant scan failed for {root}: {e}")
+
+    # Use DB variants ONLY for equality/skip checks
+    # IMPORTANT: suffix parsing must also be relative to ROOT
+    for v in sorted(set(db_variants), key=lambda v: (_suffix_num(root, v), v)):
+        meta = _db_get_statement_signature(eng, v) or {}
+        prev_hash = meta.get("content_hash")
+        prev_total = meta.get("total")
+
+        if content_hash is not None and prev_hash and prev_hash == curr_hash:
+            logger.info(f"⏭️ Statement {v} already exists with same invoice composition; skipping.")
+            return False, v
+
+        if prev_total is not None and _money2(prev_total) == curr_total:
+            logger.info(f"⏭️ Statement {v} already exists with same total; skipping.")
+            return False, v
+        curr_total = _money2(statement_total_amount_payable)
+
+        if curr_total is None:
+            logger.warning(f"Statement {statement_number}: new statement_total_amount_payable is NULL/invalid; will process.")
+            curr_hash = content_hash or "TOTAL:None"
+        else:
+            curr_hash = content_hash or f"TOTAL:{curr_total}"
+
+    # Use BOTH DB + SP variants ONLY to choose next suffix (relative to ROOT)
+    all_variants = sorted(set(db_variants + sp_variants), key=lambda v: (_suffix_num(root, v), v))
+    if all_variants:
+        max_sfx = max(_suffix_num(root, v) for v in all_variants)
+        chosen = f"{root}_2" if max_sfx == 0 else f"{root}_{max_sfx + 1}"
+    else:
+        chosen = root
+
+    if run_cache:
+        run_cache.chosen_name_by_base[root] = chosen
+        run_cache.emitted.add(chosen)
+
+    logger.info(f"✅ Will process statement {chosen} (new or changed).")
+    return True, chosen
+
+# def _apply_history_increment_rule(engine, row: Dict[str, Any]) -> Tuple[Optional[Dict[str, Any]], str, bool]:
+#     """
+#     One history row per invoice_number unless the *same invoice_number* has a different total:
+#       - If any existing variant (base or suffixed) has the SAME total -> SKIP insert and return that variant's invoice_number.
+#       - Else create next suffix and INSERT.
+#       - If no variants exist -> INSERT base as-is.
+
+#     Returns: (row_to_insert_or_None, invoice_number_used, inserted_bool)
+#     """
+#     base = row.get("invoice_number")
+#     if not base:
+#         return None, "", False
+
+#     curr_total_in_gst_amount = row.get("total_amount_payable")
+#     curr_norm = _norm2(curr_total_in_gst_amount)
+
+#     variants = _fetch_history_variants(engine, base)
+#     if not variants:
+#         return row, base, True
+
+#     for inv_no, _sfx, tot_norm in variants:
+#         if tot_norm == curr_norm:
+#             return None, inv_no, False
+
+#     next_suffix = max(v[1] for v in variants) + 1
+#     r2 = dict(row)
+#     r2["invoice_number"] = f"{base}_{next_suffix}"
+#     return r2, r2["invoice_number"], True
+
+def _parse_stmt_suffix(root: str, stmt: str) -> int:
+    """root -> 0, root_2 -> 2, root_10 -> 10"""
+    if stmt == root:
+        return 0
+    m = re.fullmatch(re.escape(root) + r"_(\d+)", stmt)
+    return int(m.group(1)) if m else 0
+
+def _apply_suffix(base: str, sfx: int) -> str:
+    return base if sfx in (0, 1) else f"{base}_{sfx}"
+
+def _invoice_exists_same_total(engine, invoice_number: str, total_amount_payable) -> bool:
+    sql = f"""
+        SELECT TOP 1 total_amount_payable
+        FROM {HISTORY_TABLE}
+        WHERE invoice_number = ?
+        ORDER BY generated_at_utc DESC
+    """
+    with engine.begin() as con:
+        row = con.exec_driver_sql(sql, (invoice_number,)).fetchone()
+    if not row:
+        return False
+    return _norm2(row[0]) == _norm2(total_amount_payable)
+
+def apply_statement_suffix_to_history_row(
+    engine,
+    hist_row: Dict[str, Any],
+    *,
+    statement_suffix: int,
+) -> Tuple[Optional[Dict[str, Any]], str, bool]:
+    """
+    Enforces: invoice_number suffix must match the statement suffix.
+    - invoice_number becomes base or base_{statement_suffix}
+    - if that invoice_number already exists with SAME total_amount_payable -> SKIP
+    - else INSERT that invoice_number
+    """
+    base = hist_row.get("invoice_number")
     if not base:
         return None, "", False
 
-    curr_total_inc = row.get("total_in_gst_amount")
-    if curr_total_inc is None:
-        curr_total_inc = (float(row.get("total_amount") or 0) + float(row.get("gst_amount") or 0))
-    curr_norm = _norm2(curr_total_inc)
+    base = _norm_id(base)
+    invoice_number_used = _apply_suffix(base, statement_suffix)
 
-    variants = _fetch_history_variants(engine, base)
-    if not variants:
-        return row, base, True
+    curr_total = hist_row.get("total_amount_payable")
 
-    for inv_no, _sfx, tot_norm in variants:
-        if tot_norm == curr_norm:
-            return None, inv_no, False
+    if _invoice_exists_same_total(engine, invoice_number_used, curr_total):
+        return None, invoice_number_used, False
 
-    next_suffix = max(v[1] for v in variants) + 1
-    r2 = dict(row)
-    r2["invoice_number"] = f"{base}_{next_suffix}"
-    return r2, r2["invoice_number"], True
+    r2 = dict(hist_row)
+    r2["invoice_number"] = invoice_number_used
+    return r2, invoice_number_used, True
 
-def insert_billing_history_batch(engine, rows: List[Dict[str, Any]]) -> List[Optional[str]]:
+def insert_billing_history_batch(engine, rows: List[Dict[str, Any]]) -> List[str]:
+    """
+    Inserts billing_history rows (one per invoice).
+    Matches dbo.billing_history schema.
+    Skips duplicates based on invoice_number.
+    """
+
     if not rows:
         logging.info("No billing_history rows to insert.")
         return []
 
+    # sanitize all rows first
     rows = sanitize_history_rows(rows)
-    used_invoice_numbers = [r.get("invoice_number") for r in rows if r.get("invoice_number")]
+    inserted_invoices = []
 
+    # FULL COLUMN LIST – MUST MATCH SQL TABLE EXACTLY
     cols = [
-        "invoice_number","purchase_order_number","company_name","company_code","account_number","mirn","distributor",
-        "bill_start_date","bill_end_date","billing_days","bill_issue_date",
-        "firm_gas_amount","spot_gas_amount","atco_usage_amount","atco_demand_amount","atco_standing_amount",
-        "transport_firm_amount","transport_overrun_amount",
-        "gas_adjustment_charges","distribution_adjustment_charges","regulatory_adjustment_charges",
-        "admin_fee","late_payment_fee",
-        "total_amount","gst_amount","total_in_gst_amount",
-        "generated_at_utc"
+        "invoice_agg_code",
+        "item_listed_bills",
+        "statement_number",
+        "invoice_number",
+        "purchase_order_number",
+        "company_name",
+        "company_code",
+        "account_number",
+        "mirn",
+        "site_name",        
+        "distributor",      
+        "bill_start_date",
+        "bill_end_date",
+        "read_start_date",   
+        "read_end_date",    
+        "billing_days",     
+        "bill_issue_date",   
+        "gj_consumption",
+        "firm_gas_amount",
+        "spot_gas_amount",
+        "atco_usage_amount",
+        "atco_demand_amount",
+        "atco_standing_amount",
+        "transport_firm_amount",
+        "transport_overrun_amount",
+        "gas_adjustment_charges",
+        "distribution_adjustment_charges",
+        "regulatory_adjustment_charges",
+        "admin_fee",
+        "late_payment_fee",
+        "total_amount",
+        "gst_amount",
+        "total_in_gst_amount",
+        "statement_total_amount",
+        "statement_gst_amount",
+        "statement_total_in_gst_amount",
+        "opening_balance",
+        "payment_received",
+        "balance_carried_forward",
+        "total_amount_payable",
+        "statement_opening_balance",
+        "statement_payment_received",
+        "statement_balance_carried_forward",
+        "statement_total_amount_payable",
+        "generated_at_utc",
+        "welcome_credit",
+        "payment_term",
     ]
-    placeholders = ",".join(["?"] * len(cols))
-    sql = f"INSERT INTO {HISTORY_TABLE} ({','.join(cols)}) VALUES ({placeholders})"
 
+    placeholders = ",".join(["?"] * len(cols))
+
+    sql = f"""
+    INSERT INTO {HISTORY_TABLE} ({','.join(cols)})
+    SELECT {placeholders}
+    WHERE NOT EXISTS (
+        SELECT 1 FROM {HISTORY_TABLE} WHERE invoice_number = ?
+    )
+    """
+
+    # Debug info
     with engine.begin() as con:
         dbname = con.exec_driver_sql("SELECT DB_NAME()").scalar()
         before = con.exec_driver_sql(f"SELECT COUNT(*) FROM {HISTORY_TABLE}").scalar()
+
     logging.info(f"Target DB: {dbname}; {HISTORY_TABLE} count before insert: {before}")
-    logging.info(f"Inserting {len(rows)} rows; first invoice={rows[0].get('invoice_number') if rows else 'N/A'}")
+    logging.info(f"Inserting {len(rows)} history rows")
 
     inserted = 0
-    try:
-        with engine.begin() as con:
-            for r in rows:
-                params = tuple(r.get(c) for c in cols)
-                con.exec_driver_sql(sql, params)
-                inserted += 1
-    except IntegrityError as ie:
-        logging.exception(f"IntegrityError inserting billing_history: {ie}")
-        raise
-    except SQLAlchemyError as se:
-        logging.exception(f"SQLAlchemyError inserting billing_history: {se}")
-        raise
 
+    # Insert rows
+    with engine.begin() as con:
+        for r in rows:
+            inv_no = r.get("invoice_number")
+            params = tuple(r.get(c) for c in cols) + (inv_no,)
+            result = con.exec_driver_sql(sql, params)
+
+            if result.rowcount > 0:
+                inserted += 1
+                inserted_invoices.append(inv_no)
+            else:
+                logging.info(f"⏭️ Duplicate history row skipped (invoice {inv_no})")
+
+    # Final count
     with engine.begin() as con:
         after = con.exec_driver_sql(f"SELECT COUNT(*) FROM {HISTORY_TABLE}").scalar()
-    logging.info(f"Inserted {inserted} rows. After count: {after} (delta={after - before})")
 
-    return used_invoice_numbers
+    logging.info(f"Inserted {inserted} new rows. After count: {after} (Δ={after - before})")
 
+    return inserted_invoices
 
 # =========================
 # SharePoint file download
@@ -791,73 +1458,89 @@ def download_file_from_sharepoint(remote_filename: str) -> bytes | None:
         print(f"Error downloading {remote_filename}: {e}")
         return None
     
-
 # =========================
-# DEBUG helpers (optional)
+# SharePoint duplicate helpers
 # =========================
-def debug_describe_table(engine, table: str = "dbo.billing_history") -> None:
-    print("\n[DEBUG] Table schema check …")
-    with engine.begin() as con:
-        exists = con.exec_driver_sql(
-            "SELECT 1 FROM sys.objects WHERE object_id = OBJECT_ID(?) AND type='U';",
-            (table,)
-        ).fetchone()
-        print(f"  - exists: {bool(exists)}")
 
-        perms = con.exec_driver_sql(
-            "SELECT HAS_PERMS_BY_NAME(?, 'OBJECT', 'INSERT');",
-            (table,)
-        ).scalar()
-        print(f"  - INSERT permission: {bool(perms)}")
+class SharePointFolderIndex:
+    def __init__(self, sp, refresh_seconds: int = 300):
+        self.sp = sp
+        self.refresh_seconds = refresh_seconds
+        self._last_refresh = 0
+        self.names = set()               # casefolded filenames
+        self.original = {}               # casefolded -> original filename
+        self.max_suffix = {}             # base(casefold) -> max suffix int (0=base)
 
-        cnt = con.exec_driver_sql(f"SELECT COUNT(*) FROM {table};").scalar()
-        print(f"  - current rows: {cnt}")
+    def refresh(self, force: bool = False):
+        now = time.time()
+        if not force and (now - self._last_refresh) < self.refresh_seconds and self.names:
+            return
 
-        cols = con.exec_driver_sql(
-            """
-            SELECT COLUMN_NAME, IS_NULLABLE, DATA_TYPE, CHARACTER_MAXIMUM_LENGTH
-            FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME='billing_history'
-            ORDER BY ORDINAL_POSITION
-            """
-        ).fetchall()
-        print("  - columns:")
-        for c in cols:
-            name, isnull, dtype, clen = c
-            clen_str = "" if clen is None else f"({clen})"
-            print(f"      {name:32s} {dtype}{clen_str}  NULLABLE={isnull}")
-    print("")
+        file_names = self.sp.list_file_names()
+        self.names = {n.casefold() for n in file_names}
+        self.original = {n.casefold(): n for n in file_names}
 
-def debug_preview_history_rows(history_rows: List[Dict[str, Any]], limit: int = 1) -> None:
-    print(f"[DEBUG] history_rows prepared: {len(history_rows)}")
-    if not history_rows:
-        return
-    for i, r in enumerate(history_rows[:limit]):
-        print(f"\n[DEBUG] Sample row #{i+1}:")
-        for k, v in r.items():
-            print(f"   {k:32s} = {repr(v)}   (type={type(v).__name__})")
+        self.max_suffix = {}
+        pat = re.compile(r"^(?P<base>.+?)(?:_(?P<sfx>\d+))?\.pdf$", re.IGNORECASE)
+        for n in file_names:
+            m = pat.match(n)
+            if not m:
+                continue
+            base = m.group("base")
+            sfx = int(m.group("sfx") or 0)
+            bcf = base.casefold()
+            self.max_suffix[bcf] = max(self.max_suffix.get(bcf, 0), sfx)
 
-def debug_validate_not_nulls(engine, row: Dict[str, Any]) -> None:
-    print("\n[DEBUG] Nullability validation against INFORMATION_SCHEMA …")
-    not_null_cols: List[str] = []
-    with engine.begin() as con:
-        rows = con.exec_driver_sql(
-            """
-            SELECT COLUMN_NAME
-            FROM INFORMATION_SCHEMA.COLUMNS
-            WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME='billing_history'
-              AND IS_NULLABLE='NO' AND COLUMN_NAME <> 'id'
-            """
-        ).fetchall()
-        not_null_cols = [r[0] for r in rows]
-    issues: List[str] = []
-    for c in not_null_cols:
-        if row.get(c) is None:
-            issues.append(c)
-    if issues:
-        print(f"  - FAIL: These NOT NULL columns are None: {issues}")
-    else:
-        print("  - PASS: All NOT NULL columns are non-null for the sample row.")
+        self._last_refresh = now
+
+    def exists(self, filename: str) -> bool:
+        self.refresh()
+        return filename.casefold() in self.names
+
+    def list_variants_stem(self, base: str) -> list[str]:
+        """
+        Returns stems (no .pdf): [base, base_2, base_3 ...] present in SharePoint.
+        """
+        self.refresh()
+        bcf = base.casefold()
+        out = []
+        for name_cf in self.names:
+            if not name_cf.endswith(".pdf"):
+                continue
+            stem_cf = name_cf[:-4]
+            if stem_cf == bcf:
+                out.append(base)
+            elif stem_cf.startswith(bcf + "_"):
+                sfx = stem_cf[len(bcf) + 1:]
+                if sfx.isdigit():
+                    out.append(f"{base}_{int(sfx)}")
+        return out
+
+    def remember_uploaded(self, filename: str):
+        self.refresh()  # ensure structures exist
+        fn_cf = filename.casefold()
+        self.names.add(fn_cf)
+        self.original[fn_cf] = filename
+
+        m = re.match(r"^(?P<stem>.+?)\.pdf$", filename, re.IGNORECASE)
+        if not m:
+            return
+        stem = m.group("stem")
+        base, sfx = stem, 0
+        mm = re.match(r"^(?P<base>.+?)_(?P<sfx>\d+)$", stem)
+        if mm:
+            base = mm.group("base")
+            sfx = int(mm.group("sfx"))
+        bcf = base.casefold()
+        self.max_suffix[bcf] = max(self.max_suffix.get(bcf, 0), sfx)
+
+def _get_sharepoint_total(base_filename: str) -> Optional[Decimal]:
+    """
+    Placeholder stub for retrieving statement total from SharePoint metadata or a log file.
+    You can later extend this to read metadata or a stored CSV/JSON alongside the PDF.
+    For now, return None to rely on DB comparisons only.
+    """
+    return None
 
 def compute_aggregated_mdq(daily_df: pd.DataFrame,
                            selected_mirns: list,
@@ -886,8 +1569,76 @@ def compute_aggregated_mdq(daily_df: pd.DataFrame,
         return None
 
     # Sum all selected MIRNs per day, then take the maximum day total
-    daily_totals = df.groupby("gas_date", as_index=False)["gj_consumption"].sum()
+    daily_totals = df.groupby("gas_date", as_index=False, observed=False)["gj_consumption"].sum()
     return float(daily_totals["gj_consumption"].max()) if not daily_totals.empty else None
+
+def compute_total_consumption(daily_df: pd.DataFrame,
+                           selected_mirns: list,
+                           start_date: Optional[pd.Timestamp],
+                           end_date: Optional[pd.Timestamp]) -> Optional[float]:
+    """
+    Total GJ consumption across the selected MIRNs within the billing period.
+    """
+    if daily_df.empty or not selected_mirns:
+        return None
+
+    df = daily_df.copy()
+    df["gas_date"] = pd.to_datetime(df["gas_date"], errors="coerce")
+    df["gj_consumption"] = pd.to_numeric(df["gj_consumption"], errors="coerce")
+    df["mirn"] = df["mirn"].astype(str)
+    df = df.dropna(subset=["gas_date", "gj_consumption"])
+
+    # Filter to selected MIRNs and the invoice's billing window
+    df = df[df["mirn"].isin([str(m) for m in selected_mirns])]
+    if pd.notna(start_date):
+        df = df[df["gas_date"] >= start_date.normalize()]
+    if pd.notna(end_date):
+        df = df[df["gas_date"] <= end_date.normalize()]
+
+    if df.empty:
+        return None
+
+    # Sum all selected MIRNs per day, then take the maximum day total
+    daily_totals = df.groupby("gas_date", as_index=False, observed=False)["gj_consumption"].sum()
+    return float(daily_totals["gj_consumption"].sum()) if not daily_totals.empty else None
+
+def write_label_value(pdf,
+        label: str, value: Any, x: Optional[float] = None, y: Optional[float] = None,
+        label_w: float = 35, value_w: Optional[float] = None, align: str = "L",
+        bold_size: float = 9, reg_size: float = 9, wrap: bool = False,
+        force_two_lines: bool = False, suffix: str = "", unit: str = "",
+        move_down: bool = True, line_height: float = 5
+    ) -> None:
+        if x is not None and y is not None:
+            pdf.set_xy(x, y)
+        elif x is not None:
+            pdf.set_x(x)
+        pdf.set_font("Arial", "B", bold_size)
+        pdf.cell(label_w, line_height, str(label), new_x=XPos.RIGHT, new_y=YPos.TOP, align=align)
+        value_str = "" if (value is None or str(value).strip() == "") else str(value) + unit + suffix
+        pdf.set_font("Arial", "", reg_size)                
+        if wrap or force_two_lines:
+            current_y = pdf.get_y()
+            val_x = pdf.get_x()
+            if value_w is None:
+                value_w = 190 - val_x - 10
+            pdf.set_xy(val_x, current_y)
+            pdf.multi_cell(value_w, line_height, value_str)
+
+            # Always consume two lines if force_two_lines=True
+            if force_two_lines:
+                lines_used = max(2, int((pdf.get_y() - current_y) / line_height + 0.5))
+                target_y = current_y + (2 * line_height)
+                pdf.set_y(target_y)
+            elif move_down:
+                pdf.set_y(pdf.get_y())
+
+        else:
+            if value_w:
+                pdf.cell(value_w, line_height, value_str, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align=align)
+            else:
+                pdf.cell(0, line_height, value_str, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align=align)
+
 
 # =========================
 # PDF Class
@@ -924,7 +1675,9 @@ class PDF(FPDF):
         self.set_font("Arial", "", 8)
         right_edge = 190
         lines = [
-            "PO Box Z5538, St Georges Terrace, WA 6865",
+            "St Georges Terrace",
+            "WA 6865",
+            "PO Box Z5538",
             "Tel: 61 8 9228 1930",
             "ABN 68 612 806 381",
             "www.agoraretail.com.au"
@@ -933,307 +1686,345 @@ class PDF(FPDF):
             text_width = self.get_string_width(line)
             self.set_xy(right_edge - text_width, 8 + i * 4.4)
             self.cell(text_width, 4.4, line)
-        self.ln(13.5)
+        self.ln(5)
         self.set_draw_color(0, 0, 0)
         self.set_line_width(0.35)
         self.line(10, self.get_y(), 190, self.get_y())
 
-# =========================
-# MAIN
-# =========================
-def main():
-    # ---- Logging setup ----
-    log_filename = "Bill_Generating_Log.log"   
-    global logger
-    logger = logging.getLogger("SharePointLogger")
-    logger.setLevel(logging.INFO)
+    def footer(self):
+        # Footer runs automatically on every page
+        self.set_y(-15)
+        self.set_font("Arial", "", 7)
 
-    sp_handler = SharePointLogHandler(log_filename)
-    sp_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
-    logger.addHandler(sp_handler)
+        # Page number dynamic
+        page_text = f"Page {self.page_no()} of {{nb}}"
+        self.cell(0, 10, page_text, 0, 0, "C")
 
-    logger.info("=== Starting PDF generation with charts ===")
-    skipped_duplicates = 0
+def unpack_invoice_fields(inv, breakdown):
+    """Extracts all relevant invoice fields into local variables and returns them as a dict."""
+    inv = inv.fillna("")
+    abn = inv.get("abn")
+    if abn is not None:
+        abn = str(abn)
 
-    # ----- Connect to SQL ----
-    # load views
-    monthly, breakdown, daily = load_views()
-    if monthly.empty:
-        logging.error("No data returned from dbo.vw_billing_charges_monthly. Exiting.")
-        return
-    if breakdown.empty:
-        logging.error("No data returned from dbo.vw_billing_charges_breakdown. Exiting.")
-        return
-
-    headers = build_invoice_headers_from_monthly(monthly)
-
-    # engine & table check
-    eng = get_engine()
-    ensure_billing_history_table(eng)
-    history_rows: List[Dict[str, Any]] = []
-
-    # ---- For each invoice ----
-    # iterate invoices
-    for _, inv in headers.iterrows():
-        pdf: Optional[PDF] = None
-
-        invoice_no = inv.get("invoice_number")
-
-        # Build charges
-        invoice_lines = breakdown[breakdown["invoice_number"] == invoice_no].copy()
-        charges_df = build_charges_df_from_breakdown(invoice_lines)
-
-        if charges_df.empty:
-            logger.info(f"No charge lines found for invoice {invoice_no}; skipping PDF and history.")
-            continue
-
-        # Header/meta (directly from monthly)
-        acct = inv.get("account_number")
-        mirn = inv.get("mirn")
-        company_name = inv.get("company_name")
-        company_code = inv.get("company_code")
-        customer_number = inv.get("customer_number")
-        abn = str(inv.get("abn"))
-        formatted_abn = (
+    fields = {
+        "invoice_agg_code":inv.get("invoice_agg_code"),
+        "item_listed_bills":inv.get("item_listed_bills"),
+        "stack_consumption_chart":inv.get("stack_consumption_chart"),
+        "company_name": inv.get("company_name"),
+        "abn": (
             f"{abn[:2]} {abn[2:5]} {abn[5:8]} {abn[8:]}"
             if abn and len(abn) == 11
             else abn
-        )
-        state = inv.get("state")
-        distributor_name = inv.get("distributor")
-        purchase_order = inv.get("purchase_order_number")
-        postal_address = inv.get("postal_address")
-        premises_address = inv.get("premises_address")
-        contact_number = inv.get("contact_number")
-        emergency_contact = inv.get("emergency_number")
-        transmission_pipeline = inv.get("transmission_pipeline")
-        issue_date = inv.get("bill_issue_date")
-        due_date = inv.get("bill_due_date")
-        start_date = inv.get("bill_start_date")
-        end_date = inv.get("bill_end_date")
-        billing_days = inv.get("billing_days")
-        start_date_dt = pd.to_datetime(start_date, errors="coerce")
-        end_date_dt   = pd.to_datetime(end_date,   errors="coerce")
-        billing_period = (
-            f"{start_date_dt.strftime('%d-%b-%y')} to {end_date_dt.strftime('%d-%b-%y')}"
-            if pd.notna(start_date_dt) and pd.notna(end_date_dt) else "TBC"
-        )
-        distributor_mhq = inv.get("distribution_mhq")
-        charge_notes = inv.get("notes")
+        ),
+        "postal_address": inv.get("postal_address"),
+        "contact_number": inv.get("contact_number"),
+        "distributor_name": inv.get("distributor"),
+        "tariff": inv.get("tariff"),
+        "emergency_contact": inv.get("emergency_number"),
+        "customer_number": inv.get("customer_number"),
+        "statement_account_number": inv.get("statement_account_number"),
+        "purchase_order": inv.get("purchase_order_number") or "",
+        "statement_number": inv.get("statement_number"),
+        "start_date": inv.get("bill_start_date"),
+        "end_date": inv.get("bill_end_date"),
+        "issue_date": inv.get("bill_issue_date"),
+        "due_date": inv.get("bill_due_date"),
+        "billing_days": inv.get("billing_days"),
+        "statement_total_amount": float(inv.get("statement_total_amount") or 0.0),
+        "statement_gst_amount": float(inv.get("statement_gst_amount") or 0.0),
+        "statement_total_in_gst_amount": float(inv.get("statement_total_in_gst_amount") or 0.0),
+        "invoice_number": inv.get("invoice_number"),
+        "acct": inv.get("account_number"),
+        "mirn": inv.get("mirn"),
+        "interval_metering": inv.get("interval_metering"),
+        "meter_number": inv.get("meter_number"),
+        "trading_name": inv.get("trading_name"),
+        "premises_address": inv.get("premises_address"),
+        "transmission_pipeline": inv.get("transmission_pipeline"),
+        "distributor_mhq": inv.get("distribution_mhq"),
+        "charge_notes": inv.get("notes"),
+        "total_amount": float(inv.get("total_amount") or 0.0),
+        "gst_amount": float(inv.get("gst_amount") or 0.0),
+        "total_in_gst_amount": float(inv.get("total_in_gst_amount") or 0.0),
+        "total_consumption": float(inv.get("gj_consumption") or 0.0),
+        "read_start_date": inv.get("read_start_date"),
+        "read_end_date": inv.get("read_end_date"),
+        "spot_gas_amount": inv.get("spot_gas_amount"),
+        "statement_opening_balance": float(inv.get("statement_opening_balance") or 0.0),
+        "statement_payment_received": float(inv.get("statement_payment_received") or 0.0),
+        "statement_balance_carried_forward": float(inv.get("statement_balance_carried_forward") or 0.0),
+        "opening_balance": float(inv.get("opening_balance") or 0.0),
+        "payment_received": float(inv.get("payment_received") or 0.0),
+        "balance_carried_forward": float(inv.get("balance_carried_forward") or 0.0),
+        "read_type": inv.get("read_type") or "",
+        "total_amount_payable": inv.get("total_amount_payable"),
+        "statement_total_amount_payable": inv.get("statement_total_amount_payable"),
+        "invoice_number_display": inv.get("invoice_number_display"),
+        "statement_number_display": inv.get("statement_number_display"),
+        "site_name": inv.get("site_name"),
+    }
 
-        # Totals from monthly (already numeric/rounded)
-        invoice_ex_gst = float(inv.get("total_amount") or 0.0)
-        gst = float(inv.get("gst_amount") or 0.0)
-        invoice_amount = float(inv.get("total_in_gst_amount") or (invoice_ex_gst + gst))
+    # Build charges_df subset for this invoice
+    invoice_number = fields["invoice_number"]
+    fields["charges_df"] = build_charges_df_from_breakdown(
+        breakdown[breakdown["invoice_number"] == invoice_number]
+    )
 
-        # History row check
-        hist_row = build_history_row_from_monthly(inv)
-        r2, invoice_no, do_insert = _apply_history_increment_rule(eng, hist_row)
+    # Shared color palette
+    fields["custom_colors"] = {
+        "Firm Gas Sales": "#0089D0",
+        "Overrun Charges": "#9DC0D7",
+        "Transport Fee": "#425B7E",
+        "Distribution Charges": "#F4A261",
+        "Adjustment Charges": "#E76F51",
+        "Other Charges": "#2A9D8F",
+    }
 
-        if not do_insert:
-            skipped_duplicates += 1
-            logger.info(f"Duplicate invoice (same total) detected: {invoice_no}; skipping PDF and history.")
-            continue   # skip everything (PDF + SharePoint)
+    return fields
 
-        # ---- PDF Setup ----
-        pdf = PDF()
-        pdf.add_page()
 
-        # Title
-        pdf.set_font("Arial", "", 16)
-        pdf.set_x(10); pdf.set_y(35)
+def generate_statement_summary_page(pdf, inv, breakdown, logger, daily, invoice_numbers, headers):
+    f = unpack_invoice_fields(inv, breakdown)
+    invoice_agg_code = f["invoice_agg_code"]
+    item_listed_bills, company_name, abn, postal_address = f["item_listed_bills"], f["company_name"], f["abn"], f["postal_address"]
+    contact_number, distributor_name = f["contact_number"], f["distributor_name"]
+    emergency_contact, customer_number = f["emergency_contact"], f["customer_number"]
+    statement_account_number, purchase_order = f["statement_account_number"], f["purchase_order"]
+    statement_number, start_date, end_date = f["statement_number"], f["start_date"], f["end_date"]
+    issue_date, due_date = f["issue_date"], f["due_date"]
+    statement_total_amount = f.get("statement_total_amount") or f.get("total_amount")
+    statement_total_in_gst_amount = f.get("statement_total_in_gst_amount") or f.get("total_in_gst_amount")
+    statement_gst_amount = f.get("statement_gst_amount") or f.get("gst_amount")
+    charges_df, custom_colors, invoice_number = f["charges_df"], f["custom_colors"], f["invoice_number"]
+    statement_opening_balance, statement_payment_received, statement_balance_carried_forward = f["statement_opening_balance"], f["statement_payment_received"], f["statement_balance_carried_forward"]
+    read_type = f["read_type"]
+    interval_metering = f["interval_metering"]
+    statement_total_amount_payable = f["statement_total_amount_payable"]
+
+    pdf.add_page()
+
+    # Title
+    pdf.set_font("Arial", "", 16)
+    pdf.set_x(10); pdf.set_y(35)
+
+    if invoice_agg_code is not None and item_listed_bills is None:
+        pdf.cell(0, 10, "Statement", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="L")
+    else:
         pdf.cell(0, 10, "Tax Invoice", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="L")
-        pdf.ln(10)
+    
+    pdf.ln(10)
 
-        # Helper
-        def write_label_value(
-            label: str, value: Any, x: Optional[float] = None, y: Optional[float] = None,
-            label_w: float = 35, value_w: Optional[float] = None, align: str = "L",
-            bold_size: float = 9, reg_size: float = 9, wrap: bool = False,
-            force_two_lines: bool = False, suffix: str = "", unit: str = "",
-            move_down: bool = True, line_height: float = 5
-        ) -> None:
-            if x is not None and y is not None:
-                pdf.set_xy(x, y)
-            elif x is not None:
-                pdf.set_x(x)
-            pdf.set_font("Arial", "B", bold_size)
-            pdf.cell(label_w, line_height, str(label), new_x=XPos.RIGHT, new_y=YPos.TOP, align=align)
-            value_str = "" if (value is None or str(value).strip() == "") else str(value) + unit + suffix
-            pdf.set_font("Arial", "", reg_size)                
-            if wrap or force_two_lines:
-                current_y = pdf.get_y()
-                val_x = pdf.get_x()
-                if value_w is None:
-                    value_w = 190 - val_x - 10
-                pdf.set_xy(val_x, current_y)
-                pdf.multi_cell(value_w, line_height, value_str)
+    # Left: Customer block (use company, ABN, postal address)
+    x0, y0 = 10, 45
+    bg_w = 90
+    line_h = 6
 
-                # Always consume two lines if force_two_lines=True
-                if force_two_lines:
-                    lines_used = max(2, int((pdf.get_y() - current_y) / line_height + 0.5))
-                    target_y = current_y + (2 * line_height)
-                    pdf.set_y(target_y)
-                elif move_down:
-                    pdf.set_y(pdf.get_y())
+    # Compute an approximate block height without using split_only (compat with older fpdf2)
+    postal_text = f"{postal_address or ''}\n"
+    postal_lines_est = max(1, len(str(postal_text).splitlines()))
+    block_h = 6 + 6 + 4 + 6 + 6 + 6
 
+    pdf.set_fill_color(220, 230, 241)
+    pdf.rect(x0, y0, bg_w, block_h, style='F')
+    pdf.set_xy(x0, y0)
+    pdf.set_font("Arial", "B", 10)
+    pdf.cell(80, 6, str(company_name or ""), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.cell(80, 6, f"ABN: {abn or ''}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.cell(80, 4, "", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.cell(80, 6, "Accounts Payable", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.multi_cell(80, 6, postal_text, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(10)
+
+    # Right: Contact & Emergency
+    right_edge = 190
+    block_start_x = 90
+    label_width = 70
+    value_width = (right_edge - block_start_x) - label_width
+
+    pdf.set_xy(block_start_x, 45)
+    pdf.set_font("Arial", "B", 9); pdf.cell(label_width, 9, "Contact Us", align='R')
+    pdf.set_font("Arial", "", 9.5); pdf.cell(value_width, 9, "1800 403 093", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
+    pdf.set_x(block_start_x); pdf.set_font("Arial", "B", 9)
+    pdf.multi_cell(label_width, 6, f"Distributor ({distributor_name or ''})\n Contact Number", align='R')
+    pdf.set_xy(block_start_x + label_width, pdf.get_y() - 12)
+    pdf.set_font("Arial", "", 9.5); pdf.multi_cell(value_width, 12, str(contact_number or ""), align='R')
+    pdf.set_x(block_start_x); pdf.set_font("Arial", "BU", 9)
+    pdf.multi_cell(label_width, 7, f"{distributor_name or ''} Gas Fault & Emergency\n Contact (24 Hrs)", align='R')
+    pdf.set_xy(block_start_x + label_width, pdf.get_y() - 14)
+    pdf.set_font("Arial", "U", 9.5); pdf.multi_cell(value_width, 12, str(emergency_contact or ""), align='R')
+
+    # Divider
+    y_top = 82; pdf.set_draw_color(0,0,0); pdf.set_line_width(0.35); pdf.line(10, y_top, 190, y_top)
+
+    # Left: Account & invoice info
+    pdf.set_xy(10, 85)
+    write_label_value(pdf, "Customer Number", customer_number, x=10)
+    write_label_value(pdf, "Account Number", statement_account_number, x=10)
+    pdf.ln(4)
+    write_label_value(pdf, "Purchase Order #", purchase_order, x=10, line_height=6)
+
+    statement_number_display = f.get("statement_number_display") or statement_number
+    if invoice_agg_code is not None and not item_listed_bills:
+        write_label_value(pdf, "Statement No.", statement_number_display, x=10, line_height=6)
+    else:
+        write_label_value(pdf, "Tax Invoice No.", statement_number_display, x=10, line_height=6)
+
+    start_dt = pd.to_datetime(start_date, errors="coerce")
+    end_dt   = pd.to_datetime(end_date,   errors="coerce")
+    billing_period_lbl = (
+        f"{start_dt.strftime('%d-%b-%y')} to {end_dt.strftime('%d-%b-%y')}"
+        if pd.notna(start_dt) and pd.notna(end_dt) else ""
+    )
+    write_label_value(pdf, "Billing Cycle", billing_period_lbl, x=10, line_height=6)
+
+    # Right: Issue/Due/Total
+    right_start_x = block_start_x
+    label_w_right = label_width
+    value_w_right = value_width
+    pdf.set_xy(right_start_x, 85)
+    issue_dt = pd.to_datetime(issue_date, errors="coerce")
+    due_dt   = pd.to_datetime(due_date,   errors="coerce")
+
+    write_label_value(pdf, 
+        "Issue Date",
+        issue_dt.strftime("%d-%b-%y") if pd.notna(issue_dt) else "",
+        x=right_start_x, label_w=label_w_right, value_w=value_w_right,
+        align="R", bold_size=10, reg_size=10.5
+    )
+
+    write_label_value(pdf, 
+        "Due Date",
+        due_dt.strftime("%d-%b-%y") if pd.notna(due_dt) else "",
+        x=right_start_x, label_w=label_w_right, value_w=value_w_right,
+        align="R", bold_size=10, reg_size=10.5
+    )
+
+    pdf.ln(16)
+    write_label_value(pdf, 
+        "Total Amount Payable", f"${statement_total_amount_payable:,.2f}",
+        x=right_start_x, label_w=label_w_right, value_w=value_w_right,
+        align="R", bold_size=10, reg_size=10.5)
+
+    # Divider
+    pdf.ln(10); pdf.set_draw_color(0,0,0); pdf.set_line_width(0.35); pdf.line(10, 119, 190, 119)
+
+    # Gas Account Summary (left)
+    pdf.set_xy(10, 119)
+    if invoice_agg_code is None or str(invoice_agg_code).strip() == "":
+        pdf.set_font("Arial", "I", 7)
+        if not (interval_metering or "").startswith("Interval") and read_type == "A":
+            msg = "This invoice is based on the actual usage data"
+        elif not (interval_metering or "").startswith("Interval") and read_type == "E":
+            msg = "This invoice is based on the estimated usage data"
+        elif not (interval_metering or "").startswith("Interval") and read_type == "S":
+            msg = "This invoice is based on the substitute usage data"
+        else:
+            msg = "This invoice is based on usage data provided by network providers"
+        pdf.cell(50, 8, msg, border=0)
+    else:
+        pdf.set_font("Arial", "I", 7)  
+        pdf.cell(50, 8, "This invoice is based on usage data provided by network providers", border=0)
+
+    pdf.set_fill_color(220, 230, 241); pdf.set_xy(10, 125)
+    pdf.set_font("Arial", "B", 9); pdf.cell(90.5, 6, "Gas Account Summary", fill=True, new_y=YPos.NEXT)
+    pdf.line(10, 131, 100, 131)
+
+    pdf.set_xy(10, 132)
+    pdf.cell(50, 6, "Opening Balance", align='L')
+    pdf.set_font("Arial", "B", 9.5); pdf.cell(40, 6, f"${float(statement_opening_balance):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
+    pdf.cell(50, 6, "Payment received", align='L')
+    pdf.set_font("Arial", "B", 9.5); pdf.cell(40, 6, f"${float(statement_payment_received):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
+    pdf.cell(50, 6, "Balance carried forward", align='L')
+    pdf.set_font("Arial", "B", 9.5); pdf.cell(40, 6, f"${float(statement_balance_carried_forward):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
+    pdf.line(75, 149, 100, 149)
+
+    # Current Charges summary
+    pdf.set_xy(10, 149.5)
+    pdf.set_font("Arial", "BU", 9)
+    pdf.cell(80, 6, "Current Charges", border=0); pdf.ln(6)
+
+    order = [
+        "Firm Gas Sales",
+        "Overrun Charges",
+        "Transport Fee",
+        "Distribution Charges",
+        "Adjustment Charges",
+        "Other Charges"
+    ]
+
+    s_for_pie_cat_statement = (
+        charges_df.assign(
+            amt=pd.to_numeric(charges_df["Statement Amount ex GST"], errors="coerce").fillna(0.0)
+        )
+        .groupby("Charge Category", observed=False)["amt"]
+        .apply(lambda s: s.drop_duplicates().sum())
+    )
+
+    s_for_pie_cat_statement = s_for_pie_cat_statement[s_for_pie_cat_statement > 0]
+
+    s_for_pie_cat_statement = s_for_pie_cat_statement.reindex(order).dropna()
+
+    for category, category_statement_total_amount in s_for_pie_cat_statement.items():
+        pdf.set_x(10); pdf.set_font("Arial", "", 9)
+        pdf.cell(50, 5, str(category), border=0, align="L")
+        pdf.cell(40, 5, f"${float(category_statement_total_amount):,.2f}", border=0, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="R")
+
+    pdf.set_xy(10, 185); pdf.set_font("Arial", "B", 9)
+    pdf.cell(50, 4, "Total of Current Charges", align='L')
+    pdf.set_font("Arial", "B", 9.5); pdf.cell(40, 4, f"${float(statement_total_amount):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
+    pdf.set_font("Arial", "B", 9); pdf.cell(50, 4, "GST Payable on Current Charges", align='L')
+    pdf.set_font("Arial", "B", 9.5); pdf.cell(40, 4, f"${float(statement_gst_amount):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
+    pdf.line(75, 194, 100, 194)
+    pdf.set_font("Arial", "B", 9); pdf.cell(50, 8, "Total of Current Charges Inc GST", align='L')
+    pdf.set_font("Arial", "B", 9.5); pdf.cell(40, 8, f"${float(statement_total_in_gst_amount):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
+    pdf.line(10, 199.5, 100, 199.5)
+
+    # ---- Pie Chart (right) ----
+    if not s_for_pie_cat_statement.empty:
+        buf1 = generate_pie_chart(s_for_pie_cat_statement, custom_colors)
+        pdf.image(buf1, x=115, y=123.5, w=80)
+        logger.info(f"Styled pie chart embedded for statement {statement_number} at x=115, y=123.5, w=80")
+
+    # Footer notes & payments
+    pdf.set_xy(10, 202)
+    pdf.set_font("Arial", "B", 9)
+    pdf.multi_cell(180, 6, "Agora Retail also operates in the retail natural gas market in Victoria supplying gas to customers who consume over ten terajoules (TJ) of gas per annum.", fill=True)
+    pdf.line(10, 217, 190, 217)
+
+    if invoice_agg_code is not None and item_listed_bills is None:
+        pdf.set_xy(10, 218)
+        pdf.set_fill_color(230, 230, 230)
+        pdf.rect(10, 218, 180, 50, style='F')
+        pdf.cell(180, 6, "Please Refer to the Following Tax Invoices to Make the Payments", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_font("Arial", "", 9)
+        for inv_no in invoice_numbers:
+
+            inv_row = headers.loc[headers["invoice_number"] == inv_no]
+
+            if not inv_row.empty:
+                inv_incl_gst = float(inv_row["total_in_gst_amount"].iloc[0] or 0.0)
             else:
-                if value_w:
-                    pdf.cell(value_w, line_height, value_str, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align=align)
-                else:
-                    pdf.cell(0, line_height, value_str, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align=align)
+                inv_incl_gst = 0.0
 
-        # Left: Customer block (use company, ABN, postal address)
-        x0, y0 = 10, 45
-        bg_w = 90
-        line_h = 6
+            formatted_amt = f"${inv_incl_gst:,.2f}"
 
-        # Compute an approximate block height without using split_only (compat with older fpdf2)
-        postal_text = f"{postal_address or ''}\n"
-        postal_lines_est = max(1, len(str(postal_text).splitlines()))
-        block_h = 6 + 6 + 4 + 6 + 6 + 6
+            pdf.set_x(20)
+            pdf.cell(
+                80, 6,
+                f"Tax Invoice No. {inv_no} - {formatted_amt}",
+                fill=True,
+                new_x=XPos.LMARGIN,
+                new_y=YPos.NEXT
+            )
 
-        pdf.set_fill_color(220, 230, 241)
-        pdf.rect(x0, y0, bg_w, block_h, style='F')
-        pdf.set_xy(x0, y0)
-        pdf.set_font("Arial", "B", 10)
-        pdf.cell(80, 6, str(company_name or ""), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.cell(80, 6, f"ABN: {formatted_abn or ''}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.cell(80, 4, "", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.cell(80, 6, "Accounts Payable", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.multi_cell(80, 6, postal_text, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.ln(10)
-
-        # Right: Contact & Emergency
-        right_edge = 190
-        block_start_x = 90
-        label_width = 70
-        value_width = (right_edge - block_start_x) - label_width
-
-        pdf.set_xy(block_start_x, 45)
-        pdf.set_font("Arial", "B", 9); pdf.cell(label_width, 9, "Contact Us", align='R')
-        pdf.set_font("Arial", "", 9.5); pdf.cell(value_width, 9, "1800 40 30 93", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
-        pdf.set_x(block_start_x); pdf.set_font("Arial", "B", 9)
-        pdf.multi_cell(label_width, 6, f"Distributor ({distributor_name or ''})\n Contact Number", align='R')
-        pdf.set_xy(block_start_x + label_width, pdf.get_y() - 12)
-        pdf.set_font("Arial", "", 9.5); pdf.multi_cell(value_width, 12, str(contact_number or ""), align='R')
-        pdf.set_x(block_start_x); pdf.set_font("Arial", "BU", 9)
-        pdf.multi_cell(label_width, 7, f"{distributor_name or ''} Gas Fault & Emergency\n Contact (24 Hrs)", align='R')
-        pdf.set_xy(block_start_x + label_width, pdf.get_y() - 14)
-        pdf.set_font("Arial", "U", 9.5); pdf.multi_cell(value_width, 12, str(emergency_contact or ""), align='R')
-
-        # Divider
-        y_top = 82; pdf.set_draw_color(0,0,0); pdf.set_line_width(0.35); pdf.line(10, y_top, 190, y_top)
-
-        # Left: Account & invoice info
-        pdf.set_xy(10, 83)
-        write_label_value("Customer Number", customer_number, x=10)
-        write_label_value("Account Number", acct, x=10)
-        write_label_value("Premises Address", premises_address, x=10, wrap=True, force_two_lines=True)
-        write_label_value("Purchase Order #", purchase_order, x=10)
-        write_label_value("Tax Invoice No.", invoice_no, x=10)
-        start_dt = pd.to_datetime(start_date, errors="coerce")
-        end_dt   = pd.to_datetime(end_date,   errors="coerce")
-        billing_period_lbl = (
-            f"{start_dt.strftime('%d-%b-%y')} to {end_dt.strftime('%d-%b-%y')}"
-            if pd.notna(start_dt) and pd.notna(end_dt) else ""
-        )
-        write_label_value("Billing Period", billing_period_lbl, x=10)
-
-        # Right: Issue/Due/Total
-        right_start_x = block_start_x
-        label_w_right = label_width
-        value_w_right = value_width
-        pdf.set_xy(right_start_x, 83)
-        issue_dt = pd.to_datetime(issue_date, errors="coerce")
-        due_dt   = pd.to_datetime(due_date,   errors="coerce")
-
-        write_label_value(
-            "Issue Date",
-            issue_dt.strftime("%d-%b-%y") if pd.notna(issue_dt) else "",
-            x=right_start_x, label_w=label_w_right, value_w=value_w_right,
-            align="R", bold_size=10, reg_size=10.5
-        )
-
-        write_label_value(
-            "Due Date",
-            due_dt.strftime("%d-%b-%y") if pd.notna(due_dt) else "",
-            x=right_start_x, label_w=label_w_right, value_w=value_w_right,
-            align="R", bold_size=10, reg_size=10.5
-        )
-
-        pdf.ln(14)
-        write_label_value(
-            "Total Amount Payable", f"${invoice_amount:,.2f}",
-            x=right_start_x, label_w=label_w_right, value_w=value_w_right,
-            align="R", bold_size=10, reg_size=10.5)
-
-        # Divider
-        pdf.ln(10); pdf.set_draw_color(0,0,0); pdf.set_line_width(0.35); pdf.line(10, 120.5, 190, 120.5)
-
-        # Gas Account Summary (left)
-        pdf.set_xy(10, 120.5)
-        pdf.set_font("Arial", "I", 8); pdf.cell(50, 8, "This invoice is based on usage data provided by network providers", border=0)
-        pdf.set_fill_color(220, 230, 241); pdf.set_xy(10, 126.5)
-        pdf.set_font("Arial", "B", 9); pdf.cell(90.5, 6, "Gas Account Summary", fill=True)
-        pdf.line(10, 132.5, 100, 132.5)
-
-        # Current Charges summary
-        pdf.set_xy(10, 145)
-        pdf.set_font("Arial", "BU", 9)
-        pdf.cell(80, 6, "Current Charges", border=0); pdf.ln(6)
-        s_for_pie_cat = (
-            charges_df.groupby("Charge Category")["Amount ex GST"]
-                        .apply(lambda s: pd.to_numeric(s, errors="coerce").fillna(0.0).sum())
-        )
-        s_for_pie_cat = s_for_pie_cat[s_for_pie_cat > 0]
-
-        order = [
-            "Firm Gas Sales",
-            "Spot Gas Sales",
-            "Transport Fee",
-            "Distribution Charges",
-            "Adjustment Charges",
-            "Other Charges"
-        ]
-
-        s_for_pie_cat.index = pd.CategoricalIndex(s_for_pie_cat.index, categories=order, ordered=True)
-        s_for_pie_cat = s_for_pie_cat.sort_index()
-
-        for category, amount in s_for_pie_cat.items():
-            pdf.set_x(10); pdf.set_font("Arial", "", 9)
-            pdf.cell(50, 5, str(category), border=0, align="L")
-            pdf.cell(40, 5, f"${float(amount):,.2f}", border=0, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="R")
-
-        pdf.set_xy(10, 185); pdf.set_font("Arial", "B", 9)
-        pdf.cell(50, 4, "Total of Current Charges", align='L')
-        pdf.set_font("Arial", "B", 9.5); pdf.cell(40, 4, f"${float(invoice_ex_gst):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
-        pdf.set_font("Arial", "B", 9); pdf.cell(50, 4, "GST Payable on Current Charges", align='L')
-        pdf.set_font("Arial", "B", 9.5); pdf.cell(40, 4, f"${float(gst):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
-        pdf.line(75, 194, 100, 194)
-        pdf.set_font("Arial", "B", 9); pdf.cell(50, 8, "Total of Current Charges Inc GST", align='L')
-        pdf.set_font("Arial", "B", 9.5); pdf.cell(40, 8, f"${float(invoice_amount):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
-        pdf.line(10, 199.5, 100, 199.5)
-
-
-        # ---- Pie Chart (right) ----
-        if not s_for_pie_cat.empty:
-            buf1 = generate_pie_chart(s_for_pie_cat, custom_colors)
-            pdf.image(buf1, x=115, y=123.5, w=80)
-            logger.info(f"Styled pie chart embedded for invoice {invoice_no} at x=115, y=123.5, w=80")
-
-        # Footer notes & payments
-        pdf.set_fill_color(220, 230, 241)
-        pdf.set_xy(10, 202)
-        pdf.set_font("Arial", "B", 9)
-        pdf.multi_cell(180, 6, "Agora Retail also operates in the retail natural gas market in Victoria supplying gas to customers who consume over ten terajoule (TJ) of gas per annum.", fill=True)
-        pdf.line(10, 217, 190, 217)
-
+    else:
         # EFT Block (Left)
         pdf.set_xy(10, 219)
+        pdf.set_fill_color(220, 230, 241)
         pdf.set_font("Arial", "B", 9)
         pdf.cell(80, 6, "Electronic Fund Transfer (EFT)", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.cell(80, 6, f"          Reference No. {invoice_no}", fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.cell(80, 6, f"Reference No. {statement_number}", fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.set_font("Arial", "B", 9); pdf.cell(30, 6, "Account Name", new_x=XPos.RIGHT, new_y=YPos.TOP)
         pdf.set_font("Arial", "", 9); pdf.cell(60, 6, "Agora Retail Pty Limited", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.set_font("Arial", "B", 9); pdf.cell(30, 6, "BSB", new_x=XPos.RIGHT, new_y=YPos.TOP)
@@ -1248,7 +2039,7 @@ def main():
         pdf.set_font("Arial", "B", 9)
         pdf.cell(80, 6, "Alternative Form of Payments*", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.set_x(110)
-        pdf.cell(80, 6, f"          Reference No. {invoice_no}", fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.cell(80, 6, f"Reference No. {statement_number}", fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.set_xy(110, pdf.get_y())
         pdf.set_font("Arial", "B", 9)
         pdf.cell(50, 4, "Call us at", new_x=XPos.RIGHT, new_y=YPos.TOP)
@@ -1259,331 +2050,995 @@ def main():
         pdf.set_x(110)
         pdf.set_font("Arial", "", 7.5)
         pdf.cell(50, 4, "*Surcharge fee may apply to the payment method other than EFT.")
-        pdf.line(10, 257, 190, 257)
-        
-        pdf.set_xy(90, 270)
-        pdf.set_font("Arial", "", 7.5)
-        pdf.cell(180, 4, "Page 1 of 2")
+        pdf.line(10, 258.5, 190, 258.5)
+    
 
-        # ====================================================== PAGE 2 ====================================================== 
+def generate_invoice_page1(pdf, inv, breakdown, daily, logger):
+    f = unpack_invoice_fields(inv, breakdown)
+    invoice_agg_code = f["invoice_agg_code"]
+    item_listed_bills, company_name, abn, postal_address = f["item_listed_bills"], f["company_name"], f["abn"], f["postal_address"]
+    distributor_name, emergency_contact = f["distributor_name"], f["emergency_contact"]
+    customer_number, acct, premises_address = f["customer_number"], f["acct"], f["premises_address"]
+    purchase_order, invoice_number, statement_number = f["purchase_order"], f["invoice_number"], f["statement_number"]
+    start_date, end_date, issue_date, due_date = f["start_date"], f["end_date"], f["issue_date"], f["due_date"]
+    total_in_gst_amount, total_amount, gst_amount = f["total_in_gst_amount"], f["total_amount"], f["gst_amount"]
+    charges_df, custom_colors = f["charges_df"], f["custom_colors"]
+    contact_number, distributor_name = f["contact_number"], f["distributor_name"]
+    opening_balance, payment_received, balance_carried_forward = f["opening_balance"], f["payment_received"], f["balance_carried_forward"]
+    read_type = f["read_type"]
+    interval_metering = f["interval_metering"]
+    total_amount_payable = f["total_amount_payable"]
+
+    pdf.add_page()
+
+    # Title
+    pdf.set_font("Arial", "", 16)
+    pdf.set_x(10); pdf.set_y(35)
+    pdf.cell(0, 10, "Tax Invoice", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="L")
+    pdf.ln(10)
+
+    # Left: Customer block (use company, ABN, postal address)
+    x0, y0 = 10, 45
+    bg_w = 90
+    line_h = 6
+
+    # Compute an approximate block height without using split_only (compat with older fpdf2)
+    postal_text = f"{postal_address or ''}\n"
+    postal_lines_est = max(1, len(str(postal_text).splitlines()))
+    block_h = 6 + 6 + 4 + 6 + 6 + 6
+
+    pdf.set_fill_color(220, 230, 241)
+    pdf.rect(x0, y0, bg_w, block_h, style='F')
+    pdf.set_xy(x0, y0)
+    pdf.set_font("Arial", "B", 10)
+    pdf.cell(80, 6, str(company_name or ""), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.cell(80, 6, f"ABN: {abn or ''}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.cell(80, 4, "", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.cell(80, 6, "Accounts Payable", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.multi_cell(80, 6, postal_text, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(10)
+
+    # Right: Contact & Emergency
+    right_edge = 190
+    block_start_x = 90
+    label_width = 70
+    value_width = (right_edge - block_start_x) - label_width
+
+    pdf.set_xy(block_start_x, 45)
+    pdf.set_font("Arial", "B", 9); pdf.cell(label_width, 9, "Contact Us", align='R')
+    pdf.set_font("Arial", "", 9.5); pdf.cell(value_width, 9, str(contact_number or ""), new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
+    pdf.set_x(block_start_x); pdf.set_font("Arial", "B", 9)
+    pdf.multi_cell(label_width, 6, f"Distributor ({distributor_name or ''})\n Contact Number", align='R')
+    pdf.set_xy(block_start_x + label_width, pdf.get_y() - 12)
+    pdf.set_font("Arial", "", 9.5); pdf.multi_cell(value_width, 12, str(contact_number or ""), align='R')
+    pdf.set_x(block_start_x); pdf.set_font("Arial", "BU", 9)
+    pdf.multi_cell(label_width, 7, f"{distributor_name or ''} Gas Fault & Emergency\n Contact (24 Hrs)", align='R')
+    pdf.set_xy(block_start_x + label_width, pdf.get_y() - 14)
+    pdf.set_font("Arial", "U", 9.5); pdf.multi_cell(value_width, 12, str(emergency_contact or ""), align='R')
+
+    # Divider
+    y_top = 82; pdf.set_draw_color(0,0,0); pdf.set_line_width(0.35); pdf.line(10, y_top, 190, y_top)
+
+    # Left: Account & invoice info
+    pdf.set_xy(10, 85)
+    write_label_value(pdf, "Customer Number", customer_number, x=10, line_height=6)
+    write_label_value(pdf, "Account Number", acct, x=10, line_height=6)
+    pdf.ln(4)
+    write_label_value(pdf, "Purchase Order #", purchase_order, x=10, line_height=6)
+    invoice_number_display = f.get("invoice_number_display") or invoice_number
+    statement_number_display = f.get("statement_number_display") or statement_number
+
+    if invoice_agg_code is not None and item_listed_bills == "Yes":
+        write_label_value(pdf, "Tax Invoice No.", statement_number_display, x=10, line_height=6)
+    else:
+        write_label_value(pdf, "Tax Invoice No.", invoice_number_display, x=10, line_height=6)
+
+    start_dt = pd.to_datetime(start_date, errors="coerce")
+    end_dt   = pd.to_datetime(end_date,   errors="coerce")
+    billing_period_lbl = (
+        f"{start_dt.strftime('%d-%b-%y')} to {end_dt.strftime('%d-%b-%y')}"
+        if pd.notna(start_dt) and pd.notna(end_dt) else ""
+    )
+    write_label_value(pdf, "Billing Cycle", billing_period_lbl, x=10, line_height=6)
+
+    # Right: Issue/Due/Total
+    right_start_x = block_start_x
+    label_w_right = label_width
+    value_w_right = value_width
+    pdf.set_xy(right_start_x, 85)
+    issue_dt = pd.to_datetime(issue_date, errors="coerce")
+    due_dt   = pd.to_datetime(due_date,   errors="coerce")
+
+    write_label_value(pdf, 
+        "Issue Date",
+        issue_dt.strftime("%d-%b-%y") if pd.notna(issue_dt) else "",
+        x=right_start_x, label_w=label_w_right, value_w=value_w_right,
+        align="R", bold_size=10, reg_size=10.5
+    )
+
+    write_label_value(pdf, 
+        "Due Date",
+        due_dt.strftime("%d-%b-%y") if pd.notna(due_dt) else "",
+        x=right_start_x, label_w=label_w_right, value_w=value_w_right,
+        align="R", bold_size=10, reg_size=10.5
+    )
+
+    pdf.ln(14)
+    write_label_value(pdf, 
+        "Total Amount Payable", f"${total_amount_payable:,.2f}",
+        x=right_start_x, label_w=label_w_right, value_w=value_w_right,
+        align="R", bold_size=10, reg_size=10.5)
+
+   # Divider
+    pdf.ln(10); pdf.set_draw_color(0,0,0); pdf.set_line_width(0.35); pdf.line(10, 119, 190, 119)
+
+    # Gas Account Summary (left)
+    if invoice_agg_code is None or str(invoice_agg_code).strip() == "":
+        pdf.set_font("Arial", "I", 7)
+        if not (interval_metering or "").startswith("Interval") and read_type == "A":
+            msg = "This invoice is based on the actual usage data"
+        elif not (interval_metering or "").startswith("Interval") and read_type == "E":
+            msg = "This invoice is based on the estimated usage data"
+        elif not (interval_metering or "").startswith("Interval") and read_type == "S":
+            msg = "This invoice is based on the substitute usage data"
+        else:
+            msg = "This invoice is based on usage data provided by network providers"
+        pdf.cell(50, 8, msg, border=0)
+    else:
+        pdf.set_font("Arial", "I", 7)
+        pdf.cell(50, 8, "This invoice is based on usage data provided by network providers", border=0)
+    pdf.set_fill_color(220, 230, 241); pdf.set_xy(10, 125)
+    pdf.set_font("Arial", "B", 9); pdf.cell(90.5, 6, "Gas Account Summary", fill=True, new_y=YPos.NEXT)
+    pdf.line(10, 131, 100, 131)
+
+    pdf.set_xy(10, 132)
+    pdf.cell(50, 6, "Opening Balance", align='L')
+    pdf.set_font("Arial", "B", 9.5); pdf.cell(40, 6, f"${float(opening_balance):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
+    pdf.cell(50, 6, "Payment received", align='L')
+    pdf.set_font("Arial", "B", 9.5); pdf.cell(40, 6, f"${float(payment_received):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
+    pdf.cell(50, 6, "Balance carried forward", align='L')
+    pdf.set_font("Arial", "B", 9.5); pdf.cell(40, 6, f"${float(balance_carried_forward):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
+    pdf.line(75, 149, 100, 149)
+
+    # Current Charges summary
+    pdf.set_xy(10, 149.5)
+    pdf.set_font("Arial", "BU", 9)
+    pdf.cell(80, 6, "Current Charges", border=0); pdf.ln(6)
+
+    order = [
+        "Firm Gas Sales",
+        "Overrun Charges",
+        "Transport Fee",
+        "Distribution Charges",
+        "Adjustment Charges",
+        "Other Charges"
+    ]
+
+    # Apply numeric conversion and aggregation
+    s_for_pie_cat = (
+        charges_df.groupby("Charge Category", observed=False)["Amount ex GST"]
+                .apply(lambda s: pd.to_numeric(s, errors="coerce").fillna(0.0).sum())
+    )
+
+    # Keep only positive values
+    s_for_pie_cat = s_for_pie_cat[s_for_pie_cat > 0]
+
+    s_for_pie_cat = s_for_pie_cat.reindex(order).dropna()
+
+    for category, amount in s_for_pie_cat.items():
+        pdf.set_x(10); pdf.set_font("Arial", "", 9)
+        pdf.cell(50, 5, str(category), border=0, align="L")
+        pdf.cell(40, 5, f"${float(amount):,.2f}", border=0, new_x=XPos.LMARGIN, new_y=YPos.NEXT, align="R")
+
+    pdf.set_xy(10, 185); pdf.set_font("Arial", "B", 9)
+    pdf.cell(50, 4, "Total of Current Charges", align='L')
+    pdf.set_font("Arial", "B", 9.5); pdf.cell(40, 4, f"${float(total_amount):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
+    pdf.set_font("Arial", "B", 9); pdf.cell(50, 4, "GST Payable on Current Charges", align='L')
+    pdf.set_font("Arial", "B", 9.5); pdf.cell(40, 4, f"${float(gst_amount):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
+    pdf.line(75, 194, 100, 194)
+    pdf.set_font("Arial", "B", 9); pdf.cell(50, 8, "Total of Current Charges Inc GST", align='L')
+    pdf.set_font("Arial", "B", 9.5); pdf.cell(40, 8, f"${float(total_in_gst_amount):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
+    pdf.line(10, 199.5, 100, 199.5)
+
+
+    # ---- Pie Chart (right) ----
+    if not s_for_pie_cat.empty:
+        buf1 = generate_pie_chart(s_for_pie_cat, custom_colors)
+        pdf.image(buf1, x=115, y=123.5, w=80)
+        logger.info(f"Styled pie chart embedded for invoice {invoice_number} at x=115, y=123.5, w=80")
+
+    # Footer notes & payments
+    pdf.set_fill_color(220, 230, 241)
+    pdf.set_xy(10, 202)
+    pdf.set_font("Arial", "B", 9)
+    pdf.multi_cell(180, 6, "Agora Retail also operates in the retail natural gas market in Victoria supplying gas to customers who consume over ten terajoules (TJ) of gas per annum.", fill=True)
+    pdf.line(10, 217, 190, 217)
+
+    # EFT Block (Left)
+    pdf.set_xy(10, 219)
+    pdf.set_font("Arial", "B", 9)
+    pdf.cell(80, 6, "Electronic Fund Transfer (EFT)", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.cell(80, 6, f"Reference No. {invoice_number_display}", fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_font("Arial", "B", 9); pdf.cell(30, 6, "Account Name", new_x=XPos.RIGHT, new_y=YPos.TOP)
+    pdf.set_font("Arial", "", 9); pdf.cell(60, 6, "Agora Retail Pty Limited", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_font("Arial", "B", 9); pdf.cell(30, 6, "BSB", new_x=XPos.RIGHT, new_y=YPos.TOP)
+    pdf.set_font("Arial", "", 9); pdf.cell(60, 6, "182 800  (Macquarie Bank Limited)", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_font("Arial", "B", 9); pdf.cell(30, 6, "Account Number", new_x=XPos.RIGHT, new_y=YPos.TOP)
+    pdf.set_font("Arial", "", 9); pdf.cell(60, 6, "1165 7541", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_font("Arial", "", 8.5); pdf.cell(30, 4, "Please send remittance Advice To", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_font("Arial", "", 8.5); pdf.cell(60, 4, "accounts@agoraretail.com.au", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    # Alternative Block (Right)
+    pdf.set_xy(110, 219)
+    pdf.set_font("Arial", "B", 9)
+    pdf.cell(80, 6, "Alternative Form of Payments*", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_x(110)
+    pdf.cell(80, 6, f"Reference No. {invoice_number_display}", fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_xy(110, pdf.get_y())
+    pdf.set_font("Arial", "B", 9)
+    pdf.cell(50, 4, "Call us at", new_x=XPos.RIGHT, new_y=YPos.TOP)
+    pdf.set_x(145)
+    pdf.set_font("Arial", "", 9)
+    pdf.cell(60, 4, "1800 403 093", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(14)
+    pdf.set_x(110)
+    pdf.set_font("Arial", "", 7.5)
+    pdf.cell(50, 4, "*Surcharge fee may apply to the payment method other than EFT.")
+    pdf.line(10, 258.5, 190, 258.5)
+
+
+def generate_invoice_page2(pdf, inv, breakdown, daily, basic, logger):
+    f = unpack_invoice_fields(inv, breakdown)
+    item_listed_bills = f["item_listed_bills"]
+    stack_consumption_chart = f["stack_consumption_chart"]
+    invoice_number = f["invoice_number"]
+    acct, mirn, transmission_pipeline = f["acct"], f["mirn"], f["transmission_pipeline"]
+    distributor_name, distributor_mhq = f["distributor_name"], f["distributor_mhq"]
+    start_date_dt = pd.to_datetime(f["start_date"], errors="coerce")
+    end_date_dt = pd.to_datetime(f["end_date"], errors="coerce")
+
+    read_start_date = pd.to_datetime(f["read_start_date"], errors="coerce")
+    read_end_date = pd.to_datetime(f["read_end_date"], errors="coerce")
+    if pd.notna(read_start_date) and pd.notna(read_end_date):
+        read_period = f"{read_start_date.strftime('%d-%b-%y')} to {read_end_date.strftime('%d-%b-%y')}"
+    else:
+        read_period = ""
+    
+    interval_metering = f["interval_metering"]
+    premises_address, charges_df = f["premises_address"], f["charges_df"]
+    trading_name = f["trading_name"]
+    total_amount, gst_amount = f["total_amount"], f["gst_amount"]
+    charge_notes = f["charge_notes"]
+    total_consumption = f["total_consumption"]
+    invoice_agg_code = f["invoice_agg_code"]
+    statement_number = f.get("statement_number_display") or f["statement_number"]
+    invoice_number = f.get("invoice_number_display") or f["invoice_number"]
+    spot_gas_amount = f["spot_gas_amount"]
+    customer_number = f["customer_number"]
+    meter_number = f["meter_number"]
+    billing_days = f["billing_days"]
+    tariff = f["tariff"]
+
+    pdf.add_page()
+
+    label_width_left = 40
+    label_width_right = 33.5
+    left_x = 10
+    right_x = 105
+    right_value_width = 50
+    font_main = "Arial"
+
+    def set_font(weight: str = "", size: float = 8.5) -> None:
+        pdf.set_font(font_main, weight, size)
+    
+    # Account Details (Left Block)
+    pdf.set_xy(left_x, 35)
+    set_font("", 9.5)
+    invoice_number_display = f.get("invoice_number_display") or invoice_number
+    write_label_value(pdf, "Tax Invoice No.", invoice_number_display, x=10, label_w=label_width_left)
+
+    # write_label_value(pdf, "Tax Invoice No.", invoice_number, x=10, label_w=label_width_left)
+    write_label_value(pdf, "Account No.", acct, x=10, label_w=label_width_left)
+    write_label_value(pdf, "MIRN", mirn, x=10, label_w=label_width_left)
+    write_label_value(pdf, "Trading Name", trading_name, x=10, label_w=label_width_left)
+    write_label_value(pdf, "Transmission Pipeline", transmission_pipeline, x=10, label_w=label_width_left)
+    write_label_value(pdf, "(if any)", "", x=10, label_w=label_width_left, line_height=3)
+    pdf.ln(2)
+
+    # Billing Details (Right Block)
+    pdf.set_xy(right_x, 35)
+    billing_days = _to_int_or_none(billing_days)
+    if billing_days == 0:
+        read_period_with_days = f"No meter read data ({billing_days} days)"
+    else:
+        read_period_with_days = f"{read_period} ({billing_days} days)"
+    write_label_value(pdf, "Read Period", read_period_with_days, x=105, label_w=label_width_right, value_w=right_value_width)
+    display_name = f"{distributor_name} ({tariff})" if str(distributor_name).strip().upper() == 'ATCO' else distributor_name
+
+    write_label_value(
+        pdf, 
+        "Distributor", 
+        display_name, 
+        x=105, 
+        label_w=label_width_right, 
+        value_w=right_value_width
+    )
+    write_label_value(pdf, "Meter Number", meter_number, x=105, label_w=label_width_right, value_w=right_value_width)
+    write_label_value(pdf, 
+                      "Distributor MHQ", 
+                      (f"{float(distributor_mhq):.2f}" if (pd.notna(distributor_mhq) and str(distributor_mhq).strip() != "") else ""),
+                      x=105, label_w=label_width_right, value_w=right_value_width, unit=" GJ")
+    write_label_value(pdf, "Premises Address", premises_address, x=105, wrap=True, force_two_lines=True, label_w=label_width_right, value_w=right_value_width)
+
+    # Divider & Section Header
+    pdf.line(10, 64.5, 190, 64.5)
+    pdf.set_y(65)
+    set_font("BU", 8)
+    pdf.cell(60, 4, "Your Gas usage and Charges summary")
+    pdf.ln(4)
+
+    columns = [
+        {"header": "Charges", "width": 60, "align": "L"},
+        {"header": "Rate", "width": 30, "align": "R"},
+        {"header": "Unit", "width": 15, "align": "L"},
+        {"header": "Total Qty", "width": 30, "align": "R"},
+        {"header": "Unit", "width": 15, "align": "L"},
+        {"header": "$      ", "width": 30, "align": "R"},
+    ]
+    stripe_height = 4
+    stripe_colors = [(220, 230, 241), (255, 255, 255)]
+    x_start = 10
+    y_start = 74
+    total_width = sum(col["width"] for col in columns)
+
+    def draw_table_bands() -> None:
+        for i in range(15):
+            pdf.set_fill_color(*stripe_colors[i % 2])
+            pdf.rect(x_start, y_start + i * stripe_height, total_width, stripe_height, style='F')
+
+    def draw_table_header() -> None:
+        pdf.set_font("Arial", "B", 8)
+        pdf.set_fill_color(0, 137, 208)
+        pdf.set_text_color(255, 255, 255)
+        for col in columns:
+            pdf.cell(col["width"], 4.1, col["header"], border="TB", align=col["align"], fill=True)
+        pdf.ln()
+        pdf.set_text_color(0, 0, 0)
+
+    draw_table_bands()
+    draw_table_header()
+
+    row_index = 0
+
+    def new_detail_page() -> None:
+        nonlocal row_index
         pdf.add_page()
-
-        label_width_left = 48
-        label_width_right = 35
-        left_x = 10
-        right_x = 105
-        right_value_width = 50
-        font_main = "Arial"
-
-        def set_font(weight: str = "", size: float = 8.5) -> None:
-            pdf.set_font(font_main, weight, size)
-
-        # Account Details (Left Block)
-        pdf.set_xy(left_x, 35)
-        set_font("", 9.5)
-        write_label_value("Account No.", acct, x=10, label_w=label_width_left)
-        write_label_value("MIRN", mirn, x=10, label_w=label_width_left)
-        write_label_value("Transmission Pipeline (if any)", transmission_pipeline, x=10, label_w=label_width_left)
-        write_label_value("Distributor", distributor_name, x=10, label_w=label_width_left)
-        write_label_value(
-            "Distributor MHQ",
-            (f"{float(distributor_mhq):.2f}" if (pd.notna(distributor_mhq) and str(distributor_mhq).strip() != "") else ""),
-            x=10, label_w=label_width_left, unit=" GJ",
-        )
-        pdf.ln(2)
-
-        # Billing Details (Right Block)
-        pdf.set_xy(right_x, 35)
-        write_label_value("Billing Period", billing_period, x=105, label_w=label_width_right, value_w=right_value_width)
-        pdf.ln(5.5)
-        write_label_value("Premises Address", premises_address, x=105, wrap=True, force_two_lines=True, label_w=label_width_right, value_w=right_value_width)
-
-        # Divider & Section Header
-        pdf.line(10, 60, 190, 60)
-        pdf.set_y(62)
-        set_font("BU", 8)
-        pdf.cell(60, 4, "Your Gas usage and Charges summary")
-        pdf.ln(5.8)
-
-        columns = [
-            {"header": "Charges", "width": 60, "align": "L"},
-            {"header": "Rate", "width": 30, "align": "R"},
-            {"header": "Unit", "width": 15, "align": "L"},
-            {"header": "Total Qty", "width": 30, "align": "R"},
-            {"header": "Unit", "width": 15, "align": "L"},
-            {"header": "$      ", "width": 30, "align": "R"},
-        ]
-        stripe_height = 4
-        stripe_colors = [(220, 230, 241), (255, 255, 255)]
-        x_start = 10
-        y_start = 72.6
-        total_width = sum(col["width"] for col in columns)
-
-        def draw_table_bands() -> None:
-            for i in range(15):
-                pdf.set_fill_color(*stripe_colors[i % 2])
-                pdf.rect(x_start, y_start + i * stripe_height, total_width, stripe_height, style='F')
-
-        def draw_table_header() -> None:
-            pdf.set_font("Arial", "B", 8)
-            pdf.set_fill_color(0, 137, 208)
-            pdf.set_text_color(255, 255, 255)
-            for col in columns:
-                pdf.cell(col["width"], 4.1, col["header"], border="TB", align=col["align"], fill=True)
-            pdf.ln()
-            pdf.set_text_color(0, 0, 0)
-
+        pdf.set_y(35)
+        set_font("BU", 10); pdf.cell(100, 6, "Gas usage and Charges (continued)")
+        pdf.ln(6)
         draw_table_bands()
         draw_table_header()
-
         row_index = 0
 
-        def new_detail_page() -> None:
-            nonlocal row_index
-            pdf.add_page()
-            pdf.set_y(35)
-            set_font("BU", 10); pdf.cell(100, 6, "Gas usage and Charges (continued)")
-            pdf.ln(6)
-            draw_table_bands()
-            draw_table_header()
-            row_index = 0
+    for category, cat_df in charges_df.groupby("Charge Category", sort=False, observed=False):
+        unit_num = pd.to_numeric(cat_df.get("Amount ex GST"), errors="coerce")
+        cat_df = cat_df.loc[unit_num.notna() & (unit_num.abs() > 1e-12)]
+        if cat_df.empty:
+            continue
+        # Category header row
+        if row_index >= 22:
+            new_detail_page()
+        pdf.set_y(y_start + row_index * stripe_height)
+        pdf.set_x(x_start)
+        pdf.set_font("Arial", "BU", 8)
+        pdf.set_fill_color(*stripe_colors[row_index % 2])
+        pdf.cell(columns[0]["width"], stripe_height, str(category), border=0, align="L", fill=True)
+        for col in columns[1:]:
+            pdf.cell(col["width"], stripe_height, "", border=0, align=col["align"], fill=True)
+        pdf.ln(stripe_height)
+        row_index += 1
 
-        for category, cat_df in charges_df.groupby("Charge Category", sort=False):
-            if cat_df.empty:
-                continue
-            # Category header row
+        # Detail rows
+        pdf.set_font("Arial", "", 8)
+        for _, row in cat_df.iterrows():
             if row_index >= 22:
                 new_detail_page()
+
+            _amt = pd.to_numeric(row.get("Amount ex GST"), errors="coerce")
+            amt_ex_gst_fmt = f"${_amt:,.2f}" if pd.notna(_amt) else ""
+
+            charge_type = str(row.get("Charge Type", "")) or ""
+
+            raw_rate = row.get("Rate")
+
+            try:
+                rate_val = Decimal(str(raw_rate))
+            except (InvalidOperation, TypeError):
+                rate_val = None
+
+            if rate_val is not None:
+                if charge_type in ("Firm Gas Sales", "Overrun Charges"):
+                    rate_fmt = f"{rate_val:.6f}"
+                else:
+                    rate_fmt = f"{rate_val:.2f}"
+            else:
+                rate_fmt = ""
+
+            values = [
+                "          " + charge_type,
+                rate_fmt,
+                str(row.get("Rate UOM", "")) if pd.notna(row.get("Rate UOM")) else "",
+                "" if pd.isna(row.get("Unit")) else f"{float(row.get('Unit')):,.2f}",\
+                str(row.get("Unit UOM", "")) if pd.notna(row.get("Unit UOM")) else "",
+                amt_ex_gst_fmt,
+            ]
+
             pdf.set_y(y_start + row_index * stripe_height)
             pdf.set_x(x_start)
-            pdf.set_font("Arial", "BU", 8)
             pdf.set_fill_color(*stripe_colors[row_index % 2])
-            pdf.cell(columns[0]["width"], stripe_height, str(category), border=0, align="L", fill=True)
-            for col in columns[1:]:
-                pdf.cell(col["width"], stripe_height, "", border=0, align=col["align"], fill=True)
+            for i, col in enumerate(columns):
+                pdf.cell(col["width"], stripe_height, values[i], border=0, align=col["align"], fill=True)
             pdf.ln(stripe_height)
             row_index += 1
 
-            def format_with_commas(value):
+    # Totals box
+    pdf.set_y(134.5)
+    pdf.set_font("Arial", "B", 8.5)
+    pdf.cell(90, 4, "Total of Current Charges", align='L')
+    pdf.cell(90, 4, f"${float(total_amount):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
+    pdf.cell(90, 4, "GST Payable on Current Charges", align='L')
+    pdf.cell(90, 4, f"${float(gst_amount):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
+    pdf.line(10, pdf.get_y()+1, 190, pdf.get_y()+1)
+
+    def fmt_gj(x: Any) -> str:
                 try:
-                    s = str(value)
-                    if not re.match(r'^-?\d+(\.\d+)?$', s):
-                        return s  # not a numeric string, return as-is
-                    int_part, dot, frac_part = s.partition('.')
-                    int_part = f"{int(int_part):,}"  # add commas to integer part
-                    return int_part + (dot + frac_part if frac_part else "")
-                except Exception:
-                    return str(value)
+                    return f"{float(x):.2f} GJ"
+                except (TypeError, ValueError):
+                    return ""
+                
+    # === Daily consumption ===
+    cust_consumption = pd.DataFrame()
+    if not daily.empty and "mirn" in daily.columns:
+        cust_consumption = daily[daily["mirn"] == mirn].copy()
 
-            # Detail rows
-            pdf.set_font("Arial", "", 8)
-            for _, row in cat_df.iterrows():
-                if row_index >= 22:
-                    new_detail_page()
+    cust_consumption_basic = pd.DataFrame()
+    if not basic.empty and "mirn" in basic.columns:
+        basic["cur_read_date"] = pd.to_datetime(basic["cur_read_date"], errors="coerce")
+        
+        start_date = (end_date_dt - pd.DateOffset(months=5)).replace(day=1)
 
-                _amt = pd.to_numeric(row.get("Amount ex GST"), errors="coerce")
-                amt_ex_gst_fmt = f"${_amt:,.2f}" if pd.notna(_amt) else ""
+        basic_6m = basic[basic["cur_read_date"] >= start_date]
 
-                charge_type = str(row.get("Charge Type", "")) or ""
-                rate_val = pd.to_numeric(row.get("Rate"), errors="coerce")
+        cust_consumption_basic = basic_6m[basic_6m["mirn"] == mirn].copy()
 
-                if pd.notna(rate_val):
-                    if charge_type in ("Firm Gas Sales", "Spot Gas Sales"):
-                        rate_fmt = f"{rate_val:,.6f}"
-                    else:
-                        rate_fmt = f"{rate_val:,.2f}"
-                else:
-                    rate_fmt = ""
+    # Calculate monthly_mdq (maximum daily consumption)
+    monthly_mdq = None
+    if not cust_consumption.empty:
+        monthly_mdq = cust_consumption["gj_consumption"].max()  # Maximum daily consumption
 
-                values = [
-                    "          " + charge_type,
-                    rate_fmt,
-                    str(row.get("Rate UOM", "")) if pd.notna(row.get("Rate UOM")) else "",
-                    "" if pd.isna(row.get("Unit")) else f"{float(row.get('Unit')):,.2f}",\
-                    str(row.get("Unit UOM", "")) if pd.notna(row.get("Unit UOM")) else "",
-                    amt_ex_gst_fmt,
-                ]
+    contract_mdq = (
+        cust_consumption["retail_mdq"].iloc[0]
+        if "retail_mdq" in cust_consumption.columns and not cust_consumption.empty
+        else None
+    )
 
-                pdf.set_y(y_start + row_index * stripe_height)
-                pdf.set_x(x_start)
-                pdf.set_fill_color(*stripe_colors[row_index % 2])
-                for i, col in enumerate(columns):
-                    pdf.cell(col["width"], stripe_height, values[i], border=0, align=col["align"], fill=True)
-                pdf.ln(stripe_height)
-                row_index += 1
+    # === Chart sizing constants ===
+    CHART_W_MM      = 180.0
+    CHART_FULL_H_MM = 64.0
+    CHART_HALF_H_MM = 32.0
 
-        # Totals box
-        pdf.set_y(133)
-        pdf.set_font("Arial", "B", 8.5)
-        pdf.cell(90, 4, "Total of Current Charges", align='L')
-        pdf.cell(90, 4, f"${float(invoice_ex_gst):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
-        pdf.cell(90, 4, "GST Payable on Current Charges", align='L')
-        pdf.cell(90, 4, f"${float(gst):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
-        pdf.line(10, pdf.get_y()+1, 190, pdf.get_y()+1)
+    # === CHARTS ===
+    # === Determine MIRNs eligible for stack charts ===
+    stack_mirns = (
+        daily.loc[
+            (daily["customer_number"] == customer_number) &
+            (daily["stack_consumption_chart"] == "Yes")
+        ]["mirn"]
+        .astype(str)
+        .unique()
+        .tolist()
+    )
 
-        # === Daily consumption ===
-        cust_consumption = pd.DataFrame()
-        if not daily.empty and "mirn" in daily.columns:
-            cust_consumption = daily[daily["mirn"] == mirn].copy()
+    global_start_date = (
+        daily.loc[daily["mirn"].isin(stack_mirns), "read_start_date"]
+        .dropna()
+        .min()
+    )
 
-        # Calculate monthly_mdq (maximum daily consumption)
-        monthly_mdq = None
-        if not cust_consumption.empty:
-            monthly_mdq = cust_consumption["gj_consumption"].max()  # Maximum daily consumption
+    global_end_date = (
+        daily.loc[daily["mirn"].isin(stack_mirns), "read_end_date"]
+        .dropna()
+        .max()
+    )
 
-        contract_mdq = cust_consumption["retail_mdq"].iloc[0]
+    if pd.notna(global_start_date) and pd.notna(global_end_date):
+        global_read_period = f"{global_start_date.strftime('%d-%b-%y')} to {global_end_date.strftime('%d-%b-%y')}"
+    else:
+        global_read_period = ""
 
-        # === MDQ box above Consumption Chart ===
-        pdf.set_xy(10, 145)
-        label_w = 30
-        value_w = 60
+    # Flag for current MIRN
+    is_stack_mirn = str(mirn) in stack_mirns
 
-        def fmt_gj(x: Any) -> str:
-            try:
-                return f"{float(x):.2f} GJ"
-            except (TypeError, ValueError):
-                return ""
+    aggregated_contract_mdq = 0.0
 
-        # MDQ box for monthly and contract MDQ
-        pdf.set_font("Arial", "BU", 8)
-        pdf.cell(label_w, 4, "MDQ of the month")
-        pdf.set_font("Arial", "U", 8)
-        pdf.cell(value_w, 4, fmt_gj(monthly_mdq), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    if stack_consumption_chart == "Yes":
+        # Sum all retail_mdq for this customer_number
+        aggregated_contract_mdq = (
+            daily.loc[
+                (daily["customer_number"] == customer_number)
+                & (daily["stack_consumption_chart"] == "Yes"),
+                "retail_mdq"
+            ]            
+            .dropna()
+            .astype(float)
+            .unique()
+            .sum()
+        )
 
-        pdf.set_font("Arial", "BU", 8)
-        pdf.cell(label_w, 4, "Contract MDQ")
-        val = "" if contract_mdq is None else fmt_gj(contract_mdq)
-        pdf.set_font("Arial", "U", 8)
-        pdf.cell(value_w, 4, val, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    selected_mirns = stack_mirns
+    multi_mirn_ok = False
+    label_w = 68
+    value_w = 40
 
-        pdf.rect(10, 145, 70, 8)
-        pdf.ln(1)
+    # ================= Full-height Consumption Chart =================
+    if not is_stack_mirn:
 
+        interval_type = (interval_metering or "").strip()
 
-        # === Chart sizing constants ===
-        CHART_W_MM      = 180.0
-        CHART_FULL_H_MM = 64.0
-        CHART_HALF_H_MM = 32.0
+        if not interval_type.startswith("Basic"):
+            # # === Comment above Consumption Chart (Right) ===
+            # pdf.set_font("Arial", "BU", 8)
+            # if monthly_mdq > contract_mdq:
+            #     if spot_gas_amount == 0:
+            #         pdf.set_xy(137, 145)
+            #         pdf.cell(100, 4, "No Overrun Charges, as this MIRN", ln=1)
+            #         pdf.set_xy(137, 149)
+            #         pdf.cell(100, 4, "is a part of Aggregated portfolio", ln=1)
 
-        # === CHARTS ===
-        selected_mirns = ['5600002119_8', '5600002162_7', '5600462393_7']
-        multi_mirn_ok = False
+            #     else:
+            #         pdf.set_xy(137, 145)
+            #         pdf.cell(100, 4, "Spot Gas Sales & Transport Charges", ln=1)
+            #         pdf.set_xy(137, 149)
+            #         pdf.cell(100, 4, "are billed as a separate line item", ln=1)
 
-        # === Full-height Consumption Chart ===
-        if mirn not in selected_mirns:
-            consumption_chart_buf = generate_consumption_chart(
-                mirn=mirn,
-                billing_period=billing_period,
-                cust_consumption_df=cust_consumption,  
-                contract_mdq=contract_mdq,
-                fig_height_mm=CHART_FULL_H_MM  # Full height for other accounts
-            )
-            embed_chart_in_pdf(pdf, consumption_chart_buf, CHART_FULL_H_MM)
+            # === MDQ box above Consumption Chart ===
+            pdf.set_xy(10, 145)
 
-        # === Half-height Consumption Chart + Aggregated MDQ Chart ===
-        if mirn in selected_mirns:
-            # Half-height consumption chart
-            consumption_chart_buf = generate_consumption_chart(
-                mirn=mirn,
-                billing_period=billing_period,
-                cust_consumption_df=cust_consumption, 
-                contract_mdq=contract_mdq,
-                fig_height_mm=CHART_HALF_H_MM  # Half height for specified accounts
-            )
-            embed_chart_in_pdf(pdf, consumption_chart_buf, CHART_HALF_H_MM)
-
-            # === Aggregated MDQ Block ===
-            aggregated_monthly_mdq = compute_aggregated_mdq(
-                daily_df=daily,
-                selected_mirns=selected_mirns,
-                start_date=start_date_dt,
-                end_date=end_date_dt
-            )
-            pdf.rect(10, pdf.get_y(), 70, 8)
-
-            pdf.rect(10, pdf.get_y(), 70, 8)
+            # MDQ box for monthly and contract MDQ
             pdf.set_font("Arial", "BU", 8)
-            pdf.cell(label_w + 20, 4, "MDQ of the month (aggregated)")
+            pdf.cell(label_w, 4, "Total Consumption for the Month")
             pdf.set_font("Arial", "U", 8)
-            pdf.cell(value_w, 4, fmt_gj(aggregated_monthly_mdq), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.cell(value_w, 4, fmt_gj(total_consumption), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
             pdf.set_font("Arial", "BU", 8)
-            pdf.cell(label_w + 20, 4, "Contract MDQ (aggregated)")
+            pdf.cell(label_w, 4, "MDQ of the month")
             pdf.set_font("Arial", "U", 8)
-            pdf.cell(value_w, 4, fmt_gj(3000), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-            pdf.ln(2)
+            pdf.cell(value_w, 4, fmt_gj(monthly_mdq), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
-            # === Multi-MIRN Chart (Stacked) ===
-            accounts_mirn_chart_buf = generate_accounts_mirn_chart(
-                billing_period=billing_period,
-                df=daily,
-                selected_mirns=selected_mirns  
+            pdf.set_font("Arial", "BU", 8)
+            pdf.cell(label_w, 4, "Contract MDQ")
+            val = "" if contract_mdq is None else fmt_gj(contract_mdq)
+            pdf.set_font("Arial", "U", 8)
+            pdf.cell(value_w, 4, val, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+            pdf.rect(10, 145, 90, 12)
+            pdf.ln(1)
+
+            pdf.set_xy(10, 160)
+            # Generate FULL interval chart
+            consumption_chart_buf = generate_consumption_chart(
+                mirn=mirn,
+                read_period=read_period,
+                cust_consumption_df=cust_consumption,
+                contract_mdq=contract_mdq,
+                fig_height_mm=CHART_FULL_H_MM
             )
+            embed_chart_in_pdf(pdf, consumption_chart_buf, CHART_FULL_H_MM, logger)
 
-            embed_chart_in_pdf(pdf, accounts_mirn_chart_buf, CHART_HALF_H_MM)
-            multi_mirn_ok = True
+        else:
+            # === Total Consumption box above Consumption Chart ===
+            pdf.set_xy(10, 149)
 
-        # # Ensure new page if needed before drawing charts
-        # def _ensure_space(h_mm: float) -> None:
-        #     try:
-        #         page_h = getattr(pdf, "h", 297)
-        #         b_margin = getattr(pdf, "b_margin", 10)
-        #         if pdf.get_y() + h_mm > (page_h - b_margin):
-        #             pdf.add_page()
-        #     except Exception:
-        #         pdf.add_page()
+            # MDQ box for monthly and contract MDQ
+            pdf.set_font("Arial", "BU", 8)
+            pdf.cell(label_w, 4, "Total Consumption for the Month")
+            pdf.set_font("Arial", "U", 8)
+            pdf.cell(value_w, 4, fmt_gj(total_consumption), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
-        # ================= “Please Note” block =================
+            pdf.rect(10, 145, 90, 12)
+            pdf.ln(1)
+
+            pdf.set_xy(10, 160)
+            # Generate BASIC non-interval chart
+            consumption_chart_buf_basic = generate_consumption_chart_basic(
+                mirn=mirn,
+                basic_read_period=read_period,
+                basic_cust_consumption_df=cust_consumption_basic,
+                contract_mdq=contract_mdq,
+                fig_height_mm=CHART_FULL_H_MM
+            )
+            embed_chart_in_pdf(pdf, consumption_chart_buf_basic, CHART_FULL_H_MM, logger)
+
+    # ================= Half-height Consumption Chart + Agg MDQ Box =================
+    if is_stack_mirn:
+
+        interval_type = (interval_metering or "").strip()
+
+        if not interval_type.startswith("Basic"):
+            # === MDQ box above Consumption Chart ===
+            pdf.set_xy(10, 145)
+
+            # MDQ box for monthly and contract MDQ
+            pdf.set_font("Arial", "BU", 8)
+            pdf.cell(label_w, 4, "Total Consumption for the Month")
+            pdf.set_font("Arial", "U", 8)
+            pdf.cell(value_w, 4, fmt_gj(total_consumption), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+            pdf.set_font("Arial", "BU", 8)
+            pdf.cell(label_w, 4, "MDQ of the month")
+            pdf.set_font("Arial", "U", 8)
+            pdf.cell(value_w, 4, fmt_gj(monthly_mdq), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+            pdf.set_font("Arial", "BU", 8)
+            pdf.cell(label_w, 4, "Contract MDQ")
+            val = "" if contract_mdq is None else fmt_gj(contract_mdq)
+            pdf.set_font("Arial", "U", 8)
+            pdf.cell(value_w, 4, val, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+            pdf.rect(10, 145, 90, 12)
+            pdf.ln(1)
+
+            pdf.set_xy(10, 160)
+            # Generate HALF interval chart
+            consumption_chart_buf = generate_consumption_chart(
+                mirn=mirn,
+                read_period=read_period,
+                cust_consumption_df=cust_consumption,
+                contract_mdq=contract_mdq,
+                fig_height_mm=CHART_HALF_H_MM
+            )
+            embed_chart_in_pdf(pdf, consumption_chart_buf, CHART_HALF_H_MM, logger)
+        
+        else:
+            # === MDQ box above Consumption Chart ===
+            pdf.set_xy(10, 149)
+
+            # MDQ box for monthly and contract MDQ
+            pdf.set_font("Arial", "BU", 8)
+            pdf.cell(label_w, 4, "Total Consumption for the Month")
+            pdf.set_font("Arial", "U", 8)
+            pdf.cell(value_w, 4, fmt_gj(total_consumption), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+            pdf.rect(10, 145, 90, 12)
+            pdf.ln(1)
+
+            pdf.set_xy(10, 160)
+            # Generate HALF interval chart
+            consumption_chart_buf_basic = generate_consumption_chart_basic(
+                mirn=mirn,
+                basic_read_period=read_period,
+                basic_cust_consumption_df=cust_consumption_basic,
+                contract_mdq=contract_mdq,
+                fig_height_mm=CHART_HALF_H_MM
+            )
+            embed_chart_in_pdf(pdf, consumption_chart_buf_basic, CHART_HALF_H_MM, logger)
+
+        # === Aggregated MDQ Block ===
+        aggregated_monthly_mdq = compute_aggregated_mdq(
+            daily_df=daily,
+            selected_mirns=stack_mirns,
+            start_date=start_date_dt,
+            end_date=end_date_dt
+        )
+
+        aggregated_total_consumption = compute_total_consumption(
+            daily_df=daily,
+            selected_mirns=stack_mirns,
+            start_date=start_date_dt,
+            end_date=end_date_dt
+        )
+
+        pdf.rect(10, pdf.get_y(), 90, 12)
+
+        pdf.set_font("Arial", "BU", 8)
+        pdf.cell(label_w, 4, "Total Consumption for the Month (aggregated)")
+        pdf.set_font("Arial", "U", 8)
+        pdf.cell(value_w, 4, fmt_gj(aggregated_total_consumption), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        
+        pdf.set_font("Arial", "BU", 8)
+        pdf.cell(label_w, 4, "MDQ of the month (aggregated)")
+        pdf.set_font("Arial", "U", 8)
+        pdf.cell(value_w, 4, fmt_gj(aggregated_monthly_mdq), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+        pdf.set_font("Arial", "BU", 8)
+        pdf.cell(label_w, 4, "Contract MDQ (aggregated)")
+        pdf.set_font("Arial", "U", 8)
+        pdf.cell(value_w, 4, fmt_gj(aggregated_contract_mdq), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.ln(2)
-        NOTE_MIN_H = 25
+
+        # === Multi-MIRN Chart (Stacked) ===
+        accounts_mirn_chart_buf = generate_accounts_mirn_chart(
+            read_period=global_read_period,
+            df=daily,
+            customer_number=customer_number,
+            stack_consumption_chart_only=True,
+            aggregated_contract_mdq=aggregated_contract_mdq,
+            period_start=global_start_date,
+            period_end=global_end_date
+        )
+
+        embed_chart_in_pdf(pdf, accounts_mirn_chart_buf, CHART_HALF_H_MM, logger)
+        multi_mirn_ok = True
+
+    # ================= “Please Note” block =================
+    NOTE_MIN_H = 25
+    W = 180
+
+    # --- build the note lines first (so height calc matches what you will print) ---
+    pdf.set_font("Arial", "", 7)
+    lines = []
+    lines.append("* Agora Retail will reconcile Network Charges for this month against the actual charges invoiced by the Network Operator and the adjustment charges will be applied accordingly on the next invoice.")
+    lines.append("* gasTrading Spot Prices are published on the website: https://gastrading.com.au/spot-market/historical-prices-and-volume/bid-and-scheduled")
+
+    if acct in {30001, 30002, 30003, 30007, 30008, 30009, 30010, 30011, 30013, 30015}:
+        lines.append("* The Australian Bureau of Statistics (ABS) has re-referenced the Sep'25 CPI index to 100.00 and aligned it with the new monthly CPI series.")
+        lines.append("* Under the terms of your contract, the Agora Firm Gas Consumption Price is adjusted on a quarterly basis. For Q1 2026 invoices, the applicable firm gas rate is calculated by taking the Dec'25 Firm Gas Consumption Price and escalated by the CPI movement from Sep'25 (index value 100.00) to Dec'25 (index value 100.97), based on the CPI index for the 8 Capital Cities.")
+
+    text3 = f"* {str(charge_notes).strip()}" if (pd.notna(charge_notes) and str(charge_notes).strip()) else ""
+    if text3:
+        lines.append(text3)
+
+    # --- measure total height (dry run) ---
+    page_h = getattr(pdf, "h", 297)
+    b_margin = getattr(pdf, "b_margin", 10)
+    t_margin = getattr(pdf, "t_margin", 10)
+
+    y0 = pdf.get_y() - 1
+
+    # Title height
+    pdf.set_font("Arial", "B", 8)
+    title_h = pdf.multi_cell(
+        W, 5, "Please Note",
+        dry_run=True, output=MethodReturnValue.HEIGHT
+    )
+
+    # Bullet height(s)
+    pdf.set_font("Arial", "", 7)
+    bullets_h = 0
+    for t in lines:
+        bullets_h += pdf.multi_cell(
+            W, 4, t,
+            dry_run=True, output=MethodReturnValue.HEIGHT
+        )
+
+    block_h = max(NOTE_MIN_H, 5 + title_h + bullets_h)  # 5 ~= your top padding fudge
+
+    # --- if it would overflow, move the cursor UP (no new page) ---
+    bottom_limit = page_h - b_margin
+    overflow = (y0 + block_h) - bottom_limit
+    if overflow > 0:
+        # move up just enough to fit; don't go above top margin
+        new_y = max(t_margin, pdf.get_y() - overflow)
+        pdf.set_y(new_y)
+        y0 = pdf.get_y()
+
+    # --- render for real ---
+    box_y = y0
+
+    pdf.set_font("Arial", "B", 8)
+    pdf.multi_cell(W, 6, "Please Note", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    pdf.set_font("Arial", "", 7)
+    for t in lines:
+        pdf.multi_cell(W, 4, t, border=0, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    box_bottom = pdf.get_y()
+    box_h = max(NOTE_MIN_H, box_bottom - box_y)
+    pdf.rect(10, box_y, W, box_h)
+# =========================
+# MAIN
+# =========================
+import gc
+import matplotlib.pyplot as plt
+
+# =========================
+# MAIN (Memory Optimized)
+# =========================
+def main():
+    # ---- Logging setup ----
+    log_filename = "Bill_Generating_Log.log"
+    global logger, sp_index
+
+    logger = logging.getLogger("SharePointLogger")
+    logger.setLevel(logging.INFO)
+    logger.handlers.clear()
+    logger.propagate = False 
+
+    skipped_duplicates = 0
+
+    # Environment Variables
+    site_url        = os.getenv("SITE_URL")
+    client_id       = os.getenv("AZURE_CLIENT_ID")
+    client_secret   = os.getenv("AZURE_CLIENT_SECRET")
+    folder_url      = os.getenv("FOLDER")
+    logo_folder_url = os.getenv("FOLDER_LOGO")
+
+    missing = [k for k, v in {
+        "SITE_URL": site_url,
+        "AZURE_CLIENT_ID": client_id,
+        "AZURE_CLIENT_SECRET": client_secret,
+        "FOLDER": folder_url,
+        "FOLDER_LOGO": logo_folder_url
+    }.items() if not v]
+
+    if missing:
+        raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
+
+    # Initialize SharePoint Client ONCE
+    sp = SharePointClient(
+        site_url=site_url,
+        client_id=client_id,
+        client_secret=client_secret,
+        folder_url=folder_url,
+        logo_folder_url=logo_folder_url
+    )
+
+    # Handlers
+    sp_handler = SharePointLogHandler(sp, log_filename)
+    sp_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logger.addHandler(sp_handler)
+    
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
+    logger.addHandler(console_handler)
+
+    logger.info("=============== Starting PDF generation (Cloud-Optimized) ===============")
+
+    # Refresh SharePoint Index
+    sp_index = SharePointFolderIndex(sp)
+    sp_index.refresh(force=True)
+
+    # Connect to SQL and load initial DataFrames
+    monthly, breakdown, daily, basic = load_views()
+    headers = build_invoice_headers_from_monthly(monthly)
+
+    # Initialize DB Engine and Cache
+    eng = get_engine()
+    ensure_billing_history_table(eng)
+    stmt_run_cache = StatementRunCache()
+
+    # ---- START STATEMENT LOOP ----
+    logging.info(f"DEBUG: headers columns are: {headers.columns.tolist()}")
+    logging.info(f"DEBUG: headers head: \n{headers.head(2)}")
+    for original_statement_number, statement_group in headers.groupby("statement_number", observed=False):
+        plt.close('all')
+        plt.clf()
+        gc.collect()
+
+        # Build stable list for processing check
+        inv_totals_df = (
+            statement_group[["invoice_number", "total_amount_payable"]]
+            .dropna(subset=["invoice_number"])
+            .assign(
+                invoice_number=lambda d: d["invoice_number"].map(_norm_id),
+                total_amount_payable=lambda d: d["total_amount_payable"].astype(float).round(2),
+            )
+            .groupby("invoice_number", as_index=False, observed=False)["total_amount_payable"]
+            .sum()
+        )
+
+        invoice_pairs = sorted(list(zip(inv_totals_df["invoice_number"], inv_totals_df["total_amount_payable"])), key=lambda t: t[0])
+        statement_total_amount_payable = float(inv_totals_df["total_amount_payable"].sum().round(2))
+        content_hash = build_statement_content_hash(invoice_pairs)
+
+        process, final_statement_number = should_process_statement(
+            eng, original_statement_number, 
+            statement_total_amount_payable=statement_total_amount_payable,
+            content_hash=content_hash, run_cache=stmt_run_cache,
+            sp_index=sp_index, logger=logger
+        )
+
+        if not process:
+            skipped_duplicates += 1
+            continue
+
+        logger.info(f"Processing Statement {final_statement_number}...")
+
+        # [STEP 2] Create PDF Object
+        pdf = PDF()
+        pdf.alias_nb_pages()
+        invoices_emitted = 0
+        summary_added = False
+        statement_suffix = _parse_stmt_suffix(_root_base(original_statement_number), final_statement_number)
 
         try:
-            page_h = getattr(pdf, "h", 297)
-            b_margin = getattr(pdf, "b_margin", 10)
-            if pdf.get_y() + NOTE_MIN_H > (page_h - b_margin):
-                pdf.add_page()
-        except Exception:
-            pass
+            # ---- For each invoice in this statement ----
+            for _, inv in statement_group.iterrows():
+                inv = inv.copy()
+                original_invoice_number = _norm_id(inv["invoice_number"])
+                
+                inv["invoice_number"] = original_invoice_number
+                inv["statement_number"] = final_statement_number
 
-        box_y = pdf.get_y()
-        pdf.set_font("Arial", "B", 8)
-        pdf.multi_cell(180, 6, "Please Note", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+                hist_row = build_history_row_from_monthly(inv)
+                r2, invoice_number, do_insert = apply_statement_suffix_to_history_row(
+                    eng, hist_row, statement_suffix=statement_suffix
+                )
 
-        pdf.set_font("Arial", "", 7)
-        text1 = "* Agora Retail will reconcile Network Charges for this month against the actual charges invoiced by the Network Operator and the adjustment charges will be applied accordingly on the next invoice."
-        text2 = "* gasTrading Spot Prices are published on the website: https://gastrading.com.au/spot-market/historical-prices-and-volume/bid-and-scheduled"
-        text3 = f"* {str(charge_notes).strip()}" if (pd.notna(charge_notes) and str(charge_notes).strip()) else ""
+                if not do_insert:
+                    skipped_duplicates += 1
+                    continue
 
-        pdf.multi_cell(180, 4, text1, border=0, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.multi_cell(180, 4, text2, border=0, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.multi_cell(180, 4, text3, border=0)
+                inv["invoice_number_lookup"] = original_invoice_number
+                inv["invoice_number_display"] = invoice_number
+                inv["statement_number_display"] = final_statement_number
+                inv["invoice_number"] = original_invoice_number
 
-        box_bottom = pdf.get_y()
-        box_h = max(NOTE_MIN_H, box_bottom - box_y)
-        pdf.rect(10, box_y, 180, box_h)
+                # Generate Summary Page (Once)
+                if not summary_added:
+                    first_row = statement_group.iloc[0].copy()
+                    first_row["statement_number_display"] = final_statement_number
+                    
+                    display_invoice_list = [
+                        _apply_suffix(_norm_id(x), statement_suffix)
+                        for x in statement_group["invoice_number"].dropna().astype(str).tolist()
+                    ]
 
-        pdf.set_xy(90, 270)
-        pdf.set_font("Arial", "", 7.5)
-        pdf.cell(180, 4, "Page 2 of 2")
+                    generate_statement_summary_page(
+                        pdf, first_row, breakdown, logger, daily, display_invoice_list, headers
+                    )
+                    summary_added = True
 
-        # ---- Save PDF to SharePoint (filename always matches SQL invoice_no) ----
-        pdf_filename = f"{invoice_no}_Generated_{GENERATE_DATE}.pdf"
-        pdf_bytes = BytesIO()
-        pdf.output(pdf_bytes)
-        pdf_bytes.seek(0)
+                # Generate Invoice Pages
+                if original_invoice_number != original_statement_number:
+                    if inv.get("item_listed_bills") != "Yes":
+                        generate_invoice_page1(pdf, inv, breakdown, daily, logger)
 
-        upload_bytes_to_sharepoint(pdf_bytes.read(), pdf_filename)
-        logger.info(f"Bill uploaded: {pdf_filename}")
+                generate_invoice_page2(pdf, inv, breakdown, daily, basic, logger)
+                invoices_emitted += 1
 
-        # ---- Insert into history ----
-        try:
-            if r2 is not None and do_insert:
-                insert_billing_history_batch(eng, [r2])
-                logger.info(f"Inserted billing history row for {invoice_no}")
-            else:
-                logger.info(f"No new history row inserted for {invoice_no} (duplicate or skipped)")
+                # DB Insert
+                if r2 is not None:
+                    insert_billing_history_batch(eng, [r2])
+            
+            # [STEP 3] Upload and Final Cleanup
+            if invoices_emitted > 0:
+                generated_ts = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+                pdf_filename = f"{final_statement_number}_Generated_{generated_ts}.pdf"
+
+                # Convert to bytes
+                pdf_content = pdf.output(dest="S")
+                if isinstance(pdf_content, str):
+                    pdf_content = pdf_content.encode("latin1")
+
+                # Upload to SharePoint
+                upload_bytes_to_sharepoint(pdf_content, pdf_filename)
+                logger.info(f"✅ Statement uploaded: {pdf_filename}")
+
+                # EXPLICIT MEMORY RELEASE
+                del pdf_content
+            
         except Exception as e:
-            logger.error(f"Failed inserting billing_history for {invoice_no}: {e}")
+            logger.error(f"❌ Error during statement {final_statement_number}: {str(e)}")
+        
+        finally:
+            # [STEP 4] The "Cloud Anchor" Cleanup
+            # This runs even if the loop fails, preventing memory carry-over
+            if 'pdf' in locals():
+                del pdf
+            plt.close('all')
+            plt.clf()
+            gc.collect()
+
+    logger.info(f"======= Completed; Skipped {skipped_duplicates} duplicates =======")
+    
+    # Flush logs to SharePoint
+    for h in list(logger.handlers):
+        try:
+            h.flush()
+        except:
+            pass
 
 if __name__ == "__main__":
     main()
