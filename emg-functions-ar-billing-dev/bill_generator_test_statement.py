@@ -243,20 +243,20 @@ def get_engine():
 def load_views() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """
     Returns:
-        monthly_df: dbo.vw_test_charges_monthly (1 row per invoice)
-        breakdown_df: dbo.vw_test_charges_breakdown (charge lines)
-        daily_df: dbo.vw_test_charges_daily (daily consumption)
+        monthly_df: dbo.vw_billing_charges_monthly (1 row per invoice)
+        breakdown_df: dbo.vw_billing_charges_breakdown (charge lines)
+        daily_df: dbo.vw_billing_charges_daily (daily consumption)
         basic_df: dbo.vvw_billing_consumption_basic (basic consumption)
     """
     eng = get_engine()
     with eng.begin() as conn:
         logging.info("Connected via SQLAlchemy engine.")
-        monthly_df = pd.read_sql("SELECT * FROM dbo.vw_test_charges_monthly;", conn)
-        breakdown_df = pd.read_sql("SELECT * FROM dbo.vw_test_charges_breakdown;", conn)
+        monthly_df = pd.read_sql("SELECT * FROM dbo.vw_billing_charges_monthly;", conn)
+        breakdown_df = pd.read_sql("SELECT * FROM dbo.vw_billing_charges_breakdown;", conn)
         try:
-            daily_df = pd.read_sql("SELECT * FROM dbo.vw_test_charges_daily;", conn)
+            daily_df = pd.read_sql("SELECT * FROM dbo.vw_billing_charges_daily;", conn)
         except Exception:
-            logging.warning("🚫 vw_test_charges_daily not found; consumption chart will be skipped.")
+            logging.warning("🚫 vw_billing_charges_daily not found; consumption chart will be skipped.")
             daily_df = pd.DataFrame()
         try:
             basic_df = pd.read_sql("SELECT * FROM dbo.vw_billing_consumption_basic;", conn)
@@ -1396,8 +1396,8 @@ def insert_billing_history_batch(engine, rows: List[Dict[str, Any]]) -> List[str
         "statement_balance_carried_forward",
         "statement_total_amount_payable",
         "generated_at_utc",
-        "payment_term",
         "welcome_credit",
+        "payment_term",
     ]
 
     placeholders = ",".join(["?"] * len(cols))
@@ -2909,9 +2909,9 @@ def main():
     stmt_run_cache = StatementRunCache()
 
     # ---- START STATEMENT LOOP ----
+    logging.info(f"DEBUG: headers columns are: {headers.columns.tolist()}")
+    logging.info(f"DEBUG: headers head: \n{headers.head(2)}")
     for original_statement_number, statement_group in headers.groupby("statement_number", observed=False):
-        
-        # [STEP 1] Memory Pre-Clean
         plt.close('all')
         plt.clf()
         gc.collect()
