@@ -3,6 +3,7 @@
 # azure-monitor-opentelemetry 
 
 azure-functions
+azure-identity
 pandas
 numpy
 matplotlib

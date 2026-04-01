@@ -30,6 +30,8 @@ import random
 import hashlib
 from dataclasses import dataclass, field
 import math
+import msal
+import requests
 #from dotenv import load_dotenv
 
 # =========================
@@ -53,6 +55,64 @@ GENERATE_DATE = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
 
 # If monthly view totals are EX-GST
 GST_RATE = 0.00
+
+def send_completion_email(skipped_count):
+    client_id = os.getenv("AZURE_CLIENT_ID")
+    client_secret = os.getenv("AZURE_CLIENT_SECRET")
+    tenant_id = os.getenv("AZURE_TENANT_ID") 
+    
+    sender_user_email = "eve.liu@gastrading.com.au" 
+    recipient_email = "eve.liu@gastrading.com.au"
+
+    authority = os.getenv("AUTHORITY")  # e.g., "https://login.microsoftonline.com/{tenant_id}"
+    scope = os.getenv("SCOPES")  # e.g., "https://graph.microsoft.com/.default"
+
+    app = msal.ConfidentialClientApplication(client_id, authority=authority, client_credential=client_secret)
+    result = app.acquire_token_for_client(scopes=[scope])   
+
+    if "access_token" not in result:
+        print(f"Could not acquire token: {result.get('error_description')}")
+        return
+
+    access_token = result["access_token"]
+
+    endpoint = f"https://graph.microsoft.com/v1.0/users/{sender_user_email}/sendMail"
+    email_msg = {
+        "message": {
+            "subject": "✅ Bill Generation Completed",
+            "body": {
+                "contentType": "HTML",
+                "content": f"""
+                <h3>Process Finished</h3>
+                <p>The PDF generation task has completed successfully.</p>
+                <ul>
+                    <li><b>Status:</b> Success</li>
+                    <li><b>Duplicates Skipped:</b> {skipped_count}</li>
+                    <li><b>Completed At:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</li>
+                </ul>
+                <p>Detailed logs are available in the SharePoint log file.</p>
+                """
+            },
+            "toRecipients": [
+                {"emailAddress": {"address": recipient_email}}
+            ]
+        }
+    }
+
+    # 3. Send Request
+    response = requests.post(
+        endpoint,
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json"
+        },
+        json=email_msg
+    )
+
+    if response.status_code == 202:
+        print("Email sent successfully via Graph API!")
+    else:
+        print(f"Failed to send email: {response.status_code} - {response.text}")
 
 # =========================
 # SharePoint connection
@@ -905,7 +965,17 @@ def generate_accounts_mirn_chart(
     )
 
     # Build tick marks ONLY for billing-period range
-    tick_positions = pd.date_range(start=start_date, end=end_date, freq="D")
+    num_days = (end_date - start_date).days
+    
+    if num_days > 60:
+        tick_freq = "5D"
+    elif num_days > 31:
+        tick_freq = "2D"
+    else:
+        tick_freq = "D"
+
+    # Build tick marks based on dynamic frequency
+    tick_positions = pd.date_range(start=start_date, end=end_date, freq=tick_freq)
 
     ax.set_xticks(tick_positions)
     ax.set_xticklabels(
@@ -3032,6 +3102,8 @@ def main():
             gc.collect()
 
     logger.info(f"======= Completed; Skipped {skipped_duplicates} duplicates =======")
+
+    #send_completion_email(skipped_duplicates)
     
     # Flush logs to SharePoint
     for h in list(logger.handlers):
