@@ -306,17 +306,17 @@ def load_views() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         monthly_df: dbo.vw_billing_charges_monthly (1 row per invoice)
         breakdown_df: dbo.vw_billing_charges_breakdown (charge lines)
         daily_df: dbo.vw_billing_charges_daily (daily consumption)
-        basic_df: dbo.vvw_billing_consumption_basic (basic consumption)
+        basic_df: dbo.vw_billing_consumption_basic (basic consumption)
     """
     eng = get_engine()
     with eng.begin() as conn:
         logging.info("Connected via SQLAlchemy engine.")
-        monthly_df = pd.read_sql("SELECT * FROM dbo.vw_billing_charges_monthly;", conn)
-        breakdown_df = pd.read_sql("SELECT * FROM dbo.vw_billing_charges_breakdown;", conn)
+        monthly_df = pd.read_sql("SELECT * FROM dbo.vw_test_charges_monthly WHERE company_code = 'SJG';", conn)
+        breakdown_df = pd.read_sql("SELECT * FROM dbo.vw_test_charges_breakdown WHERE account_number IN (30019, 30020, 30021, 30022, 30023, 30024, 30025, 30026);", conn)
         try:
-            daily_df = pd.read_sql("SELECT * FROM dbo.vw_billing_charges_daily;", conn)
+            daily_df = pd.read_sql("SELECT * FROM dbo.vw_test_charges_daily WHERE account_number IN (30019, 30020, 30021, 30022, 30023, 30024, 30025, 30026);", conn)
         except Exception:
-            logging.warning("🚫 vw_billing_charges_daily not found; consumption chart will be skipped.")
+            logging.warning("🚫 vw_test_charges_daily not found; consumption chart will be skipped.")
             daily_df = pd.DataFrame()
         try:
             basic_df = pd.read_sql("SELECT * FROM dbo.vw_billing_consumption_basic;", conn)
@@ -664,7 +664,7 @@ def generate_consumption_chart(
     read_period: str,
     cust_consumption_df: pd.DataFrame,
     contract_mdq: Optional[float],
-    fig_height_mm: float = 80.0
+    fig_height_mm: float = 32.0  # Adjusted to match your working example
 ) -> BytesIO:
     if cust_consumption_df.empty:
         return BytesIO()
@@ -673,16 +673,14 @@ def generate_consumption_chart(
     df["gas_date"] = pd.to_datetime(df["gas_date"], errors="coerce")
     df["gj_consumption"] = pd.to_numeric(df["gj_consumption"], errors="coerce")
     df = df.dropna(subset=["gas_date", "gj_consumption"]).sort_values("gas_date")
+    
     if df.empty:
         return BytesIO()
 
     start_date = df["gas_date"].min()
-    if pd.isna(start_date) and df["pre_read_date"] is not None:
-        start_date = df["pre_read_date"]
-
     end_date = df["gas_date"].max()
 
-    fig_width_mm = 180.0
+    fig_width_mm = 188.0
     fig = plt.figure(figsize=(fig_width_mm / 25.4, fig_height_mm / 25.4))
     ax = fig.add_subplot(111)
 
@@ -690,9 +688,17 @@ def generate_consumption_chart(
     fig.patch.set_facecolor(light_blue)
     ax.set_facecolor(light_blue)
 
-    fig.subplots_adjust(left=0.12, right=0.98, top=0.94, bottom=0.32)
+    # --- Updated to match working function ---
+    # bottom=0.28 gives room for labels + legend at low heights
+    if fig_height_mm > 40:
+        bottom_margin = 0.18  # Full height (64mm)
+    else:
+        bottom_margin = 0.32  # Half height (32mm)
 
-    ax.set_title(f"MIRN: {mirn}    Read Period (Current Billing Cycle): {read_period}", fontsize=7, fontweight="bold", pad=4)
+    fig.subplots_adjust(left=0.12, right=0.98, top=0.92, bottom=bottom_margin)
+
+    ax.set_title(f"MIRN: {mirn}    Read Period (Current Billing Cycle): {read_period}", 
+                 fontsize=7, fontweight="bold", pad=4)
 
     ax.bar(df["gas_date"], df["gj_consumption"], label="Daily Consumption", alpha=0.95, color="#0089D0")
 
@@ -705,15 +711,19 @@ def generate_consumption_chart(
             zorder=3
         )
 
-    ax.set_xlim(start_date - pd.Timedelta(days=0.7), end_date + pd.Timedelta(days=0.7))
-    ax.xaxis.set_major_locator(mdates.DayLocator(interval=1))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b"))
-    ax.margins(x=0.005)
+    ax.set_xlim(start_date - pd.Timedelta(days=1), end_date + pd.Timedelta(days=1))
+    
+    # --- Dynamic Ticks (Adopted from working function) ---
+    num_days = (end_date - start_date).days
+    tick_freq = "5D" if num_days > 60 else ("2D" if num_days > 31 else "D")
+    tick_positions = pd.date_range(start=start_date, end=end_date, freq=tick_freq)
 
-    ax.tick_params(axis="x", labelrotation=45, labelsize=6, pad=3, length=0)
-    for lbl in ax.get_xticklabels():
-        lbl.set_fontweight("bold")
+    ax.set_xticks(tick_positions)
+    ax.set_xticklabels([d.strftime("%d %b") for d in tick_positions], 
+                       rotation=45, fontsize=6, fontweight="bold")
+    ax.tick_params(axis="x", length=0)
 
+    # --- Y Axis and Grid ---
     max_y = float(df["gj_consumption"].max() or 0)
     mdq_y = float(contract_mdq or 0)
     ymax = max(max_y, mdq_y)
@@ -721,21 +731,24 @@ def generate_consumption_chart(
     ax.set_axisbelow(True)
     ax.grid(which="both", axis="both", linestyle="--", linewidth=0.5)
     ax.tick_params(axis="y", labelsize=6)
+    
     for s in ("top", "right", "left"):
         ax.spines[s].set_visible(False)
     ax.spines["bottom"].set_linewidth(1)
 
+    # --- Legend (Adopted from working function) ---
+    legend_y_offset = -0.05 if fig_height_mm > 40 else -0.1
     handles, labels = ax.get_legend_handles_labels()
-    if handles:
-        fig.legend(
-            handles, labels,
-            loc="lower center",
-            bbox_to_anchor=(0.5, -0.1),
-            ncol=max(1, len(labels)),
-            frameon=False,
-            prop=FontProperties(size=6, weight="bold")
-        )
+    fig.legend(
+        handles, labels,
+        loc="lower center",
+        bbox_to_anchor=(0.5, legend_y_offset),
+        ncol=max(1, len(labels)),
+        frameon=False,
+        prop=FontProperties(size=6, weight="bold")
+    )
 
+    # --- Save with bbox_inches="tight" ---
     buf_c = BytesIO()
     fig.savefig(buf_c, format="png", dpi=300, bbox_inches="tight", facecolor=fig.get_facecolor())
     buf_c.seek(0)
@@ -765,7 +778,7 @@ def generate_consumption_chart_basic(
 
     end_date = max_date + pd.offsets.MonthEnd(0)
 
-    fig_width_mm = 180.0
+    fig_width_mm = 188.0
     fig = plt.figure(figsize=(fig_width_mm / 25.4, fig_height_mm / 25.4))
     ax = fig.add_subplot(111)
 
@@ -773,15 +786,22 @@ def generate_consumption_chart_basic(
     fig.patch.set_facecolor(light_blue)
     ax.set_facecolor(light_blue)
 
-    fig.subplots_adjust(left=0.12, right=0.98, top=0.94, bottom=0.32)
+    if fig_height_mm > 40:
+        bottom_margin = 0.18
+        legend_y_offset = -0.15 # Anchor for ax.legend
+    else:
+        bottom_margin = 0.32
+        legend_y_offset = -0.28
 
-    ax.set_title(f"MIRN: {mirn}    Read Period (Current Billing Cycle): {basic_read_period}", fontsize=7, fontweight="bold", pad=4)
+    fig.subplots_adjust(left=0.12, right=0.98, top=0.92, bottom=bottom_margin)
+
+    ax.set_title(f"MIRN: {mirn}    Read Period (Current Billing Cycle): {basic_read_period}", fontsize=7, fontweight="bold", pad=6)
 
     ax.bar(df["cur_read_date"], df["gj_consumption"], width=10, label="Consumption", alpha=0.95, color="#0089D0")
 
     ax.set_xlim(start_date - pd.Timedelta(days=0.7), end_date + pd.Timedelta(days=0.7))
     ax.xaxis.set_major_locator(mdates.MonthLocator(interval=1))
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b"))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%b %y"))
     ax.margins(x=0.0005)
 
     ax.tick_params(axis="x", labelrotation=45, labelsize=6, pad=3, length=0)
@@ -799,10 +819,10 @@ def generate_consumption_chart_basic(
 
     handles, labels = ax.get_legend_handles_labels()
     if handles:
-        fig.legend(
+        ax.legend(
             handles, labels,
-            loc="lower center",
-            bbox_to_anchor=(0.5, -0.1),
+            loc="upper center",
+            bbox_to_anchor=(0.5, legend_y_offset),
             ncol=max(1, len(labels)),
             frameon=False,
             prop=FontProperties(size=6, weight="bold")
@@ -874,7 +894,7 @@ def generate_accounts_mirn_chart(
     if pd.isna(start_date) or pd.isna(end_date):
         return BytesIO()
     
-    fig_width_mm = 180
+    fig_width_mm = 188
     fig_height_mm: float = 32.0
     fig = plt.figure(figsize=(fig_width_mm / 25.4, fig_height_mm / 25.4))
     ax = fig.add_subplot(111)
@@ -1011,7 +1031,7 @@ def embed_chart_in_pdf(pdf: FPDF, chart_buf: BytesIO, chart_height_mm: float, lo
         return
 
     y_start = pdf.get_y()  # Current y position of the PDF
-    CHART_W_MM = 180.0
+    CHART_W_MM = 188.0
     pdf.image(chart_buf, x=10, y=y_start, w=CHART_W_MM, h=chart_height_mm)
     pdf.set_y(y_start + chart_height_mm + 2)  # Update the y position for the next element
     logger.info(f"Chart embedded at y={y_start}, height={chart_height_mm}")
@@ -1674,7 +1694,7 @@ def compute_total_consumption(daily_df: pd.DataFrame,
 
 def write_label_value(pdf,
         label: str, value: Any, x: Optional[float] = None, y: Optional[float] = None,
-        label_w: float = 35, value_w: Optional[float] = None, align: str = "L",
+        label_w: float = 40, value_w: Optional[float] = None, align: str = "L",
         bold_size: float = 9, reg_size: float = 9, wrap: bool = False,
         force_two_lines: bool = False, suffix: str = "", unit: str = "",
         move_down: bool = True, line_height: float = 5
@@ -1691,7 +1711,7 @@ def write_label_value(pdf,
             current_y = pdf.get_y()
             val_x = pdf.get_x()
             if value_w is None:
-                value_w = 190 - val_x - 10
+                value_w = 198 - val_x - 10
             pdf.set_xy(val_x, current_y)
             pdf.multi_cell(value_w, line_height, value_str)
 
@@ -1743,11 +1763,11 @@ class PDF(FPDF):
             except Exception as e:
                 logger.error(f"Error rendering logo: {e}")
         self.set_font("Arial", "", 8)
-        right_edge = 190
+        right_edge = 198
         lines = [
-            "St Georges Terrace",
-            "WA 6865",
             "PO Box Z5538",
+            "St Georges Terrace",
+            "WA 6831",
             "Tel: 61 8 9228 1930",
             "ABN 68 612 806 381",
             "www.agoraretail.com.au"
@@ -1759,7 +1779,7 @@ class PDF(FPDF):
         self.ln(5)
         self.set_draw_color(0, 0, 0)
         self.set_line_width(0.35)
-        self.line(10, self.get_y(), 190, self.get_y())
+        self.line(10, self.get_y(), 198, self.get_y())
 
     def footer(self):
         # Footer runs automatically on every page
@@ -1891,41 +1911,98 @@ def generate_statement_summary_page(pdf, inv, breakdown, logger, daily, invoice_
     line_h = 6
 
     # Compute an approximate block height without using split_only (compat with older fpdf2)
-    postal_text = f"{postal_address or ''}\n"
-    postal_lines_est = max(1, len(str(postal_text).splitlines()))
-    block_h = 6 + 6 + 4 + 6 + 6 + 6
+    # Logic to separate "Attention" from the address
+    raw_address = str(postal_address or "")
+    if raw_address.startswith("Attention:"):
+        # We split by the first space after the name. 
+        # Assuming the name is 'FirstName LastName' (2 words)
+        parts = raw_address.split(" ", 3) # "Attention:", "Vicente", "Enger", "Rest..."
+        if len(parts) >= 4:
+            # Reconstruct: "Attention: Vicente Enger" + newline + "49 Peel Road..."
+            postal_text = f"{parts[0]} {parts[1]} {parts[2]}\n{parts[3]}"
+        else:
+            postal_text = raw_address
+    else:
+        postal_text = raw_address
 
+    # 2. Recalculate block height based on the new newline
+    postal_lines_est = len(postal_text.splitlines())
+    # 6mm per line of multi_cell + the fixed header heights
+    block_h = 6 + 6 + 4 + 6 + (postal_lines_est * 6)
+
+    # 3. PDF Rendering
     pdf.set_fill_color(220, 230, 241)
     pdf.rect(x0, y0, bg_w, block_h, style='F')
     pdf.set_xy(x0, y0)
     pdf.set_font("Arial", "B", 10)
+    
     pdf.cell(80, 6, str(company_name or ""), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.cell(80, 6, f"ABN: {abn or ''}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.cell(80, 4, "", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.cell(80, 6, "Accounts Payable", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.multi_cell(80, 6, postal_text, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    
+    # multi_cell handles the \n we inserted automatically
+    pdf.multi_cell(80, 6, postal_text)
     pdf.ln(10)
 
     # Right: Contact & Emergency
-    right_edge = 190
-    block_start_x = 90
-    label_width = 70
+    right_edge = 198
+    block_start_x = 105
+    label_width = 40
     value_width = (right_edge - block_start_x) - label_width
 
-    pdf.set_xy(block_start_x, 45)
-    pdf.set_font("Arial", "B", 9); pdf.cell(label_width, 9, "Contact Us", align='R')
-    pdf.set_font("Arial", "", 9.5); pdf.cell(value_width, 9, "1800 403 093", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
-    pdf.set_x(block_start_x); pdf.set_font("Arial", "B", 9)
-    pdf.multi_cell(label_width, 6, f"Distributor ({distributor_name or ''})\n Contact Number", align='R')
-    pdf.set_xy(block_start_x + label_width, pdf.get_y() - 12)
-    pdf.set_font("Arial", "", 9.5); pdf.multi_cell(value_width, 12, str(contact_number or ""), align='R')
-    pdf.set_x(block_start_x); pdf.set_font("Arial", "BU", 9)
-    pdf.multi_cell(label_width, 7, f"{distributor_name or ''} Gas Fault & Emergency\n Contact (24 Hrs)", align='R')
-    pdf.set_xy(block_start_x + label_width, pdf.get_y() - 14)
-    pdf.set_font("Arial", "U", 9.5); pdf.multi_cell(value_width, 12, str(emergency_contact or ""), align='R')
+    # Starting Y position
+    current_y = 45
+    pdf.set_xy(block_start_x, current_y)
+
+    def draw_contact_row(label, value, is_bold_val=False, is_underlined=False, row_h=5):
+        nonlocal current_y
+        pdf.set_xy(block_start_x, current_y)
+        
+        # Draw Label (Right Aligned)
+        pdf.set_font("Arial", "B", 9)
+        pdf.multi_cell(label_width, row_h, label, align='R')
+        
+        # Save the Y reached by the label to know how far to move down for the next row
+        next_y = pdf.get_y()
+        
+        # Determine Value Style
+        style = ""
+        if is_bold_val: style += "B"
+        if is_underlined: style += "U"
+        
+        # Draw Value (Right Aligned)
+        # We set Y back to where the row started so the value aligns with the top of the label
+        pdf.set_xy(block_start_x + label_width, current_y)
+        pdf.set_font("Arial", style, 9.5)
+        
+        # If label is 2 lines (row_h*2), we vertically center the value or keep it at top
+        val_h = row_h if "\n" not in label else row_h * 2
+        pdf.multi_cell(value_width, val_h, str(value or ""), align='R')
+        
+        # Update current_y for the next row
+        current_y = max(next_y, pdf.get_y()) + 1 # +1 for a tiny gap
+
+    # 1. Your Account Manager
+    draw_contact_row("Your Account Manager", "Tony Tucker")
+    
+    # 2. Email
+    draw_contact_row("Email", "tony.tucker@agoraretail.com.au")
+    
+    # 3. Mobile
+    draw_contact_row("Mobile", "0498 843 721")
+    
+    # 4. Distributor (ATCO)
+    dist_label = f"Distributor ({distributor_name})"
+    draw_contact_row(dist_label, str(contact_number))
+
+    # 5. Emergency (Two lines)
+    # Using \n in the label automatically triggers the multi-line logic
+    emg_label = f"Gas Fault & Emergency\n{distributor_name} Contact (24 Hrs)"
+    draw_contact_row(emg_label, str(emergency_contact), is_underlined=True)
 
     # Divider
-    y_top = 82; pdf.set_draw_color(0,0,0); pdf.set_line_width(0.35); pdf.line(10, y_top, 190, y_top)
+    y_top = 82; pdf.set_draw_color(0,0,0); pdf.set_line_width(0.35); pdf.line(10, y_top, 198, y_top)
 
     # Left: Account & invoice info
     pdf.set_xy(10, 85)
@@ -1949,9 +2026,9 @@ def generate_statement_summary_page(pdf, inv, breakdown, logger, daily, invoice_
     write_label_value(pdf, "Billing Cycle", billing_period_lbl, x=10, line_height=6)
 
     # Right: Issue/Due/Total
-    right_start_x = block_start_x
-    label_w_right = label_width
-    value_w_right = value_width
+    right_start_x = block_start_x + label_width + 10
+    label_w_right = label_width - 30
+    value_w_right = value_width - 20
     pdf.set_xy(right_start_x, 85)
     issue_dt = pd.to_datetime(issue_date, errors="coerce")
     due_dt   = pd.to_datetime(due_date,   errors="coerce")
@@ -1970,14 +2047,14 @@ def generate_statement_summary_page(pdf, inv, breakdown, logger, daily, invoice_
         align="R", bold_size=10, reg_size=10.5
     )
 
-    pdf.ln(16)
+    pdf.ln(14)
     write_label_value(pdf, 
         "Total Amount Payable", f"${statement_total_amount_payable:,.2f}",
         x=right_start_x, label_w=label_w_right, value_w=value_w_right,
         align="R", bold_size=10, reg_size=10.5)
 
     # Divider
-    pdf.ln(10); pdf.set_draw_color(0,0,0); pdf.set_line_width(0.35); pdf.line(10, 119, 190, 119)
+    pdf.ln(10); pdf.set_draw_color(0,0,0); pdf.set_line_width(0.35); pdf.line(10, 119, 198, 119)
 
     # Gas Account Summary (left)
     pdf.set_xy(10, 119)
@@ -2053,20 +2130,20 @@ def generate_statement_summary_page(pdf, inv, breakdown, logger, daily, invoice_
     # ---- Pie Chart (right) ----
     if not s_for_pie_cat_statement.empty:
         buf1 = generate_pie_chart(s_for_pie_cat_statement, custom_colors)
-        pdf.image(buf1, x=115, y=123.5, w=80)
-        logger.info(f"Styled pie chart embedded for statement {statement_number} at x=115, y=123.5, w=80")
+        pdf.image(buf1, x=123, y=123.5, w=80)
+        logger.info(f"Styled pie chart embedded for statement {statement_number} at x=123, y=123.5, w=80")
 
     # Footer notes & payments
     pdf.set_xy(10, 202)
     pdf.set_font("Arial", "B", 9)
-    pdf.multi_cell(180, 6, "Agora Retail also operates in the retail natural gas market in Victoria supplying gas to customers who consume over ten terajoules (TJ) of gas per annum.", fill=True)
-    pdf.line(10, 217, 190, 217)
+    pdf.multi_cell(188, 6, "Agora Retail also operates in the retail natural gas market in Victoria supplying gas to customers who consume over ten terajoules (TJ) of gas per annum.", fill=True)
+    pdf.line(10, 217, 198, 217)
 
     if invoice_agg_code is not None and item_listed_bills is None:
         pdf.set_xy(10, 218)
         pdf.set_fill_color(230, 230, 230)
-        pdf.rect(10, 218, 180, 50, style='F')
-        pdf.cell(180, 6, "Please Refer to the Following Tax Invoices to Make the Payments", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.rect(10, 218, 188, 50, style='F')
+        pdf.cell(188, 6, "Please Refer to the Following Tax Invoices to Make the Payments", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.set_font("Arial", "", 9)
         for inv_no in invoice_numbers:
 
@@ -2093,34 +2170,34 @@ def generate_statement_summary_page(pdf, inv, breakdown, logger, daily, invoice_
         pdf.set_xy(10, 219)
         pdf.set_fill_color(220, 230, 241)
         pdf.set_font("Arial", "B", 9)
-        pdf.cell(80, 6, "Electronic Fund Transfer (EFT)", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.cell(80, 6, f"Reference No. {statement_number}", fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.set_font("Arial", "B", 9); pdf.cell(30, 6, "Account Name", new_x=XPos.RIGHT, new_y=YPos.TOP)
-        pdf.set_font("Arial", "", 9); pdf.cell(60, 6, "Agora Retail Pty Limited", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.set_font("Arial", "B", 9); pdf.cell(30, 6, "BSB", new_x=XPos.RIGHT, new_y=YPos.TOP)
-        pdf.set_font("Arial", "", 9); pdf.cell(60, 6, "182 800  (Macquarie Bank Limited)", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.set_font("Arial", "B", 9); pdf.cell(30, 6, "Account Number", new_x=XPos.RIGHT, new_y=YPos.TOP)
-        pdf.set_font("Arial", "", 9); pdf.cell(60, 6, "1165 7541", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.set_font("Arial", "", 8.5); pdf.cell(30, 4, "Please send remittance Advice To", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.set_font("Arial", "", 8.5); pdf.cell(60, 4, "accounts@agoraretail.com.au", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.cell(90, 6, "Electronic Fund Transfer (EFT)", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.cell(90, 6, f"Reference No. {statement_number}", fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_font("Arial", "B", 9); pdf.cell(35, 6, "Account Name", new_x=XPos.RIGHT, new_y=YPos.TOP)
+        pdf.set_font("Arial", "", 9); pdf.cell(65, 6, "Agora Retail Pty Limited", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_font("Arial", "B", 9); pdf.cell(35, 6, "BSB", new_x=XPos.RIGHT, new_y=YPos.TOP)
+        pdf.set_font("Arial", "", 9); pdf.cell(65, 6, "182 800  (Macquarie Bank Limited)", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_font("Arial", "B", 9); pdf.cell(35, 6, "Account Number", new_x=XPos.RIGHT, new_y=YPos.TOP)
+        pdf.set_font("Arial", "", 9); pdf.cell(65, 6, "1165 7541", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_font("Arial", "", 8.5); pdf.cell(35, 4, "Please send remittance Advice To", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_font("Arial", "", 8.5); pdf.cell(65, 4, "accounts@agoraretail.com.au", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
         # Alternative Block (Right)
-        pdf.set_xy(110, 219)
+        pdf.set_xy(108, 219)
         pdf.set_font("Arial", "B", 9)
-        pdf.cell(80, 6, "Alternative Form of Payments*", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.set_x(110)
-        pdf.cell(80, 6, f"Reference No. {statement_number}", fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.set_xy(110, pdf.get_y())
+        pdf.cell(90, 6, "Alternative Form of Payments*", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_x(108)
+        pdf.cell(90, 6, f"Reference No. {statement_number}", fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_xy(108, pdf.get_y())
         pdf.set_font("Arial", "B", 9)
         pdf.cell(50, 4, "Call us at", new_x=XPos.RIGHT, new_y=YPos.TOP)
         pdf.set_x(145)
         pdf.set_font("Arial", "", 9)
         pdf.cell(60, 4, "1800 403 093", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.ln(14)
-        pdf.set_x(110)
+        pdf.set_x(108)
         pdf.set_font("Arial", "", 7.5)
-        pdf.cell(50, 4, "*Surcharge fee may apply to the payment method other than EFT.")
-        pdf.line(10, 258.5, 190, 258.5)
+        pdf.cell(90, 4, "*Surcharge fee may apply to the payment method other than EFT.")
+        pdf.line(10, 258.5, 198, 258.5)
     
 
 def generate_invoice_page1(pdf, inv, breakdown, daily, logger):
@@ -2153,10 +2230,26 @@ def generate_invoice_page1(pdf, inv, breakdown, daily, logger):
     line_h = 6
 
     # Compute an approximate block height without using split_only (compat with older fpdf2)
-    postal_text = f"{postal_address or ''}\n"
-    postal_lines_est = max(1, len(str(postal_text).splitlines()))
-    block_h = 6 + 6 + 4 + 6 + 6 + 6
+    # Logic to separate "Attention" from the address
+    raw_address = str(postal_address or "")
+    if raw_address.startswith("Attention:"):
+        # We split by the first space after the name. 
+        # Assuming the name is 'FirstName LastName' (2 words)
+        parts = raw_address.split(" ", 3) # "Attention:", "Vicente", "Enger", "Rest..."
+        if len(parts) >= 4:
+            # Reconstruct: "Attention: Vicente Enger" + newline + "49 Peel Road..."
+            postal_text = f"{parts[0]} {parts[1]} {parts[2]}\n{parts[3]}"
+        else:
+            postal_text = raw_address
+    else:
+        postal_text = raw_address
 
+    # 2. Recalculate block height based on the new newline
+    postal_lines_est = len(postal_text.splitlines())
+    # 6mm per line of multi_cell + the fixed header heights
+    block_h = 6 + 6 + 4 + 6 + (postal_lines_est * 6)
+
+    # 3. PDF Rendering
     pdf.set_fill_color(220, 230, 241)
     pdf.rect(x0, y0, bg_w, block_h, style='F')
     pdf.set_xy(x0, y0)
@@ -2165,29 +2258,69 @@ def generate_invoice_page1(pdf, inv, breakdown, daily, logger):
     pdf.cell(80, 6, f"ABN: {abn or ''}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.cell(80, 4, "", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.cell(80, 6, "Accounts Payable", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.multi_cell(80, 6, postal_text, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    # multi_cell handles the \n we inserted automatically
+    pdf.multi_cell(80, 6, postal_text)
     pdf.ln(10)
 
     # Right: Contact & Emergency
-    right_edge = 190
-    block_start_x = 90
-    label_width = 70
+    right_edge = 198
+    block_start_x = 105
+    label_width = 40
     value_width = (right_edge - block_start_x) - label_width
 
-    pdf.set_xy(block_start_x, 45)
-    pdf.set_font("Arial", "B", 9); pdf.cell(label_width, 9, "Contact Us", align='R')
-    pdf.set_font("Arial", "", 9.5); pdf.cell(value_width, 9, str(contact_number or ""), new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
-    pdf.set_x(block_start_x); pdf.set_font("Arial", "B", 9)
-    pdf.multi_cell(label_width, 6, f"Distributor ({distributor_name or ''})\n Contact Number", align='R')
-    pdf.set_xy(block_start_x + label_width, pdf.get_y() - 12)
-    pdf.set_font("Arial", "", 9.5); pdf.multi_cell(value_width, 12, str(contact_number or ""), align='R')
-    pdf.set_x(block_start_x); pdf.set_font("Arial", "BU", 9)
-    pdf.multi_cell(label_width, 7, f"{distributor_name or ''} Gas Fault & Emergency\n Contact (24 Hrs)", align='R')
-    pdf.set_xy(block_start_x + label_width, pdf.get_y() - 14)
-    pdf.set_font("Arial", "U", 9.5); pdf.multi_cell(value_width, 12, str(emergency_contact or ""), align='R')
+    # Starting Y position
+    current_y = 45
+    pdf.set_xy(block_start_x, current_y)
+
+    def draw_contact_row(label, value, is_bold_val=False, is_underlined=False, row_h=5):
+        nonlocal current_y
+        pdf.set_xy(block_start_x, current_y)
+        
+        # Draw Label (Right Aligned)
+        pdf.set_font("Arial", "B", 9)
+        pdf.multi_cell(label_width, row_h, label, align='R')
+        
+        # Save the Y reached by the label to know how far to move down for the next row
+        next_y = pdf.get_y()
+        
+        # Determine Value Style
+        style = ""
+        if is_bold_val: style += "B"
+        if is_underlined: style += "U"
+        
+        # Draw Value (Right Aligned)
+        # We set Y back to where the row started so the value aligns with the top of the label
+        pdf.set_xy(block_start_x + label_width, current_y)
+        pdf.set_font("Arial", style, 9.5)
+        
+        # If label is 2 lines (row_h*2), we vertically center the value or keep it at top
+        val_h = row_h if "\n" not in label else row_h * 2
+        pdf.multi_cell(value_width, val_h, str(value or ""), align='R')
+        
+        # Update current_y for the next row
+        current_y = max(next_y, pdf.get_y()) + 1 # +1 for a tiny gap
+
+    # 1. Your Account Manager
+    draw_contact_row("Your Account Manager", "Tony Tucker")
+    
+    # 2. Email
+    draw_contact_row("Email", "tony.tucker@agoraretail.com.au")
+    
+    # 3. Mobile
+    draw_contact_row("Mobile", "0498 843 721")
+    
+    # 4. Distributor (ATCO)
+    dist_label = f"Distributor ({distributor_name})"
+    draw_contact_row(dist_label, str(contact_number))
+
+    # 5. Emergency (Two lines)
+    # Using \n in the label automatically triggers the multi-line logic
+    emg_label = f"Gas Fault & Emergency\n{distributor_name} Contact (24 Hrs)"
+    draw_contact_row(emg_label, str(emergency_contact), is_underlined=True)
 
     # Divider
-    y_top = 82; pdf.set_draw_color(0,0,0); pdf.set_line_width(0.35); pdf.line(10, y_top, 190, y_top)
+    y_top = 82; pdf.set_draw_color(0,0,0); pdf.set_line_width(0.35); pdf.line(10, y_top, 198, y_top)
 
     # Left: Account & invoice info
     pdf.set_xy(10, 85)
@@ -2212,9 +2345,9 @@ def generate_invoice_page1(pdf, inv, breakdown, daily, logger):
     write_label_value(pdf, "Billing Cycle", billing_period_lbl, x=10, line_height=6)
 
     # Right: Issue/Due/Total
-    right_start_x = block_start_x
-    label_w_right = label_width
-    value_w_right = value_width
+    right_start_x = block_start_x + label_width + 10
+    label_w_right = label_width - 30
+    value_w_right = value_width - 20
     pdf.set_xy(right_start_x, 85)
     issue_dt = pd.to_datetime(issue_date, errors="coerce")
     due_dt   = pd.to_datetime(due_date,   errors="coerce")
@@ -2240,7 +2373,7 @@ def generate_invoice_page1(pdf, inv, breakdown, daily, logger):
         align="R", bold_size=10, reg_size=10.5)
 
    # Divider
-    pdf.ln(10); pdf.set_draw_color(0,0,0); pdf.set_line_width(0.35); pdf.line(10, 119, 190, 119)
+    pdf.ln(10); pdf.set_draw_color(0,0,0); pdf.set_line_width(0.35); pdf.line(10, 119, 198, 119)
 
     # Gas Account Summary (left)
     if invoice_agg_code is None or str(invoice_agg_code).strip() == "":
@@ -2314,48 +2447,47 @@ def generate_invoice_page1(pdf, inv, breakdown, daily, logger):
     # ---- Pie Chart (right) ----
     if not s_for_pie_cat.empty:
         buf1 = generate_pie_chart(s_for_pie_cat, custom_colors)
-        pdf.image(buf1, x=115, y=123.5, w=80)
-        logger.info(f"Styled pie chart embedded for invoice {invoice_number} at x=115, y=123.5, w=80")
+        pdf.image(buf1, x=123, y=123.5, w=80)
+        logger.info(f"Styled pie chart embedded for invoice {invoice_number} at x=123, y=123.5, w=80")
 
     # Footer notes & payments
-    pdf.set_fill_color(220, 230, 241)
     pdf.set_xy(10, 202)
     pdf.set_font("Arial", "B", 9)
-    pdf.multi_cell(180, 6, "Agora Retail also operates in the retail natural gas market in Victoria supplying gas to customers who consume over ten terajoules (TJ) of gas per annum.", fill=True)
-    pdf.line(10, 217, 190, 217)
+    pdf.multi_cell(188, 6, "Agora Retail also operates in the retail natural gas market in Victoria supplying gas to customers who consume over ten terajoules (TJ) of gas per annum.", fill=True)
+    pdf.line(10, 217, 198, 217)
 
     # EFT Block (Left)
     pdf.set_xy(10, 219)
+    pdf.set_fill_color(220, 230, 241)
     pdf.set_font("Arial", "B", 9)
-    pdf.cell(80, 6, "Electronic Fund Transfer (EFT)", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.cell(80, 6, f"Reference No. {invoice_number_display}", fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.set_font("Arial", "B", 9); pdf.cell(30, 6, "Account Name", new_x=XPos.RIGHT, new_y=YPos.TOP)
-    pdf.set_font("Arial", "", 9); pdf.cell(60, 6, "Agora Retail Pty Limited", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.set_font("Arial", "B", 9); pdf.cell(30, 6, "BSB", new_x=XPos.RIGHT, new_y=YPos.TOP)
-    pdf.set_font("Arial", "", 9); pdf.cell(60, 6, "182 800  (Macquarie Bank Limited)", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.set_font("Arial", "B", 9); pdf.cell(30, 6, "Account Number", new_x=XPos.RIGHT, new_y=YPos.TOP)
-    pdf.set_font("Arial", "", 9); pdf.cell(60, 6, "1165 7541", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.set_font("Arial", "", 8.5); pdf.cell(30, 4, "Please send remittance Advice To", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.set_font("Arial", "", 8.5); pdf.cell(60, 4, "accounts@agoraretail.com.au", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.cell(90, 6, "Electronic Fund Transfer (EFT)", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.cell(90, 6, f"Reference No. {invoice_number_display}", fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_font("Arial", "B", 9); pdf.cell(35, 6, "Account Name", new_x=XPos.RIGHT, new_y=YPos.TOP)
+    pdf.set_font("Arial", "", 9); pdf.cell(65, 6, "Agora Retail Pty Limited", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_font("Arial", "B", 9); pdf.cell(35, 6, "BSB", new_x=XPos.RIGHT, new_y=YPos.TOP)
+    pdf.set_font("Arial", "", 9); pdf.cell(65, 6, "182 800  (Macquarie Bank Limited)", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_font("Arial", "B", 9); pdf.cell(35, 6, "Account Number", new_x=XPos.RIGHT, new_y=YPos.TOP)
+    pdf.set_font("Arial", "", 9); pdf.cell(65, 6, "1165 7541", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_font("Arial", "", 8.5); pdf.cell(35, 4, "Please send remittance Advice To", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_font("Arial", "", 8.5); pdf.cell(65, 4, "accounts@agoraretail.com.au", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
     # Alternative Block (Right)
-    pdf.set_xy(110, 219)
+    pdf.set_xy(108, 219)
     pdf.set_font("Arial", "B", 9)
-    pdf.cell(80, 6, "Alternative Form of Payments*", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.set_x(110)
-    pdf.cell(80, 6, f"Reference No. {invoice_number_display}", fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.set_xy(110, pdf.get_y())
+    pdf.cell(90, 6, "Alternative Form of Payments*", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_x(108)
+    pdf.cell(90, 6, f"Reference No. {invoice_number_display}", fill=True, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_xy(108, pdf.get_y())
     pdf.set_font("Arial", "B", 9)
     pdf.cell(50, 4, "Call us at", new_x=XPos.RIGHT, new_y=YPos.TOP)
     pdf.set_x(145)
     pdf.set_font("Arial", "", 9)
     pdf.cell(60, 4, "1800 403 093", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.ln(14)
-    pdf.set_x(110)
+    pdf.set_x(108)
     pdf.set_font("Arial", "", 7.5)
-    pdf.cell(50, 4, "*Surcharge fee may apply to the payment method other than EFT.")
-    pdf.line(10, 258.5, 190, 258.5)
-
+    pdf.cell(90, 4, "*Surcharge fee may apply to the payment method other than EFT.")
+    pdf.line(10, 258.5, 198, 258.5)
 
 def generate_invoice_page2(pdf, inv, breakdown, daily, basic, logger):
     f = unpack_invoice_fields(inv, breakdown)
@@ -2422,26 +2554,26 @@ def generate_invoice_page2(pdf, inv, breakdown, daily, basic, logger):
         read_period_with_days = f"No meter read data ({billing_days} days)"
     else:
         read_period_with_days = f"{read_period} ({billing_days} days)"
-    write_label_value(pdf, "Read Period", read_period_with_days, x=105, label_w=label_width_right, value_w=right_value_width)
+    write_label_value(pdf, "Read Period", read_period_with_days, x=113, label_w=label_width_right, value_w=right_value_width)
     display_name = f"{distributor_name} ({tariff})" if str(distributor_name).strip().upper() == 'ATCO' else distributor_name
 
     write_label_value(
         pdf, 
         "Distributor", 
         display_name, 
-        x=105, 
+        x=113, 
         label_w=label_width_right, 
         value_w=right_value_width
     )
-    write_label_value(pdf, "Meter Number", meter_number, x=105, label_w=label_width_right, value_w=right_value_width)
+    write_label_value(pdf, "Meter Number", meter_number, x=113, label_w=label_width_right, value_w=right_value_width)
     write_label_value(pdf, 
                       "Distributor MHQ", 
                       (f"{float(distributor_mhq):.2f}" if (pd.notna(distributor_mhq) and str(distributor_mhq).strip() != "") else ""),
-                      x=105, label_w=label_width_right, value_w=right_value_width, unit=" GJ")
-    write_label_value(pdf, "Premises Address", premises_address, x=105, wrap=True, force_two_lines=True, label_w=label_width_right, value_w=right_value_width)
+                      x=113, label_w=label_width_right, value_w=right_value_width, unit=" GJ")
+    write_label_value(pdf, "Premises Address", premises_address, x=113, wrap=True, force_two_lines=True, label_w=label_width_right, value_w=right_value_width)
 
     # Divider & Section Header
-    pdf.line(10, 64.5, 190, 64.5)
+    pdf.line(10, 64.5, 198, 64.5)
     pdf.set_y(65)
     set_font("BU", 8)
     pdf.cell(60, 4, "Your Gas usage and Charges summary")
@@ -2453,7 +2585,7 @@ def generate_invoice_page2(pdf, inv, breakdown, daily, basic, logger):
         {"header": "Unit", "width": 15, "align": "L"},
         {"header": "Total Qty", "width": 30, "align": "R"},
         {"header": "Unit", "width": 15, "align": "L"},
-        {"header": "$      ", "width": 30, "align": "R"},
+        {"header": "$      ", "width": 38, "align": "R"},
     ]
     stripe_height = 4
     stripe_colors = [(220, 230, 241), (255, 255, 255)]
@@ -2555,10 +2687,10 @@ def generate_invoice_page2(pdf, inv, breakdown, daily, basic, logger):
     pdf.set_y(134.5)
     pdf.set_font("Arial", "B", 8.5)
     pdf.cell(90, 4, "Total of Current Charges", align='L')
-    pdf.cell(90, 4, f"${float(total_amount):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
+    pdf.cell(98, 4, f"${float(total_amount):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
     pdf.cell(90, 4, "GST Payable on Current Charges", align='L')
-    pdf.cell(90, 4, f"${float(gst_amount):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
-    pdf.line(10, pdf.get_y()+1, 190, pdf.get_y()+1)
+    pdf.cell(98, 4, f"${float(gst_amount):,.2f}", new_x=XPos.LMARGIN, new_y=YPos.NEXT, align='R')
+    pdf.line(10, pdf.get_y()+1, 198, pdf.get_y()+1)
 
     def fmt_gj(x: Any) -> str:
                 try:
@@ -2593,7 +2725,7 @@ def generate_invoice_page2(pdf, inv, breakdown, daily, basic, logger):
     )
 
     # === Chart sizing constants ===
-    CHART_W_MM      = 180.0
+    CHART_W_MM      = 188.0
     CHART_FULL_H_MM = 64.0
     CHART_HALF_H_MM = 32.0
 
@@ -2842,7 +2974,7 @@ def generate_invoice_page2(pdf, inv, breakdown, daily, basic, logger):
 
     # ================= “Please Note” block =================
     NOTE_MIN_H = 25
-    W = 180
+    W = 188
 
     # --- build the note lines first (so height calc matches what you will print) ---
     pdf.set_font("Arial", "", 7)
@@ -2850,9 +2982,9 @@ def generate_invoice_page2(pdf, inv, breakdown, daily, basic, logger):
     lines.append("* Agora Retail will reconcile Network Charges for this month against the actual charges invoiced by the Network Operator and the adjustment charges will be applied accordingly on the next invoice.")
     lines.append("* gasTrading Spot Prices are published on the website: https://gastrading.com.au/spot-market/historical-prices-and-volume/bid-and-scheduled")
 
-    if acct in {30001, 30002, 30003, 30007, 30008, 30009, 30010, 30011, 30013, 30015}:
-        lines.append("* The Australian Bureau of Statistics (ABS) has re-referenced the Sep'25 CPI index to 100.00 and aligned it with the new monthly CPI series.")
-        lines.append("* Under the terms of your contract, the Agora Firm Gas Consumption Price is adjusted on a quarterly basis. For Q1 2026 invoices, the applicable firm gas rate is calculated by taking the Dec'25 Firm Gas Consumption Price and escalated by the CPI movement from Sep'25 (index value 100.00) to Dec'25 (index value 100.97), based on the CPI index for the 8 Capital Cities.")
+    # if acct in {30001, 30002, 30003, 30007, 30008, 30009, 30010, 30011, 30013, 30015}:
+    #     lines.append("* The Australian Bureau of Statistics (ABS) has re-referenced the Sep'25 CPI index to 100.00 and aligned it with the new monthly CPI series.")
+    #     lines.append("* Under the terms of your contract, the Agora Firm Gas Consumption Price is adjusted on a quarterly basis. For Q1 2026 invoices, the applicable firm gas rate is calculated by taking the Dec'25 Firm Gas Consumption Price and escalated by the CPI movement from Sep'25 (index value 100.00) to Dec'25 (index value 100.97), based on the CPI index for the 8 Capital Cities.")
 
     text3 = f"* {str(charge_notes).strip()}" if (pd.notna(charge_notes) and str(charge_notes).strip()) else ""
     if text3:
